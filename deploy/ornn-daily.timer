@@ -1,0 +1,10 @@
+[Unit]
+Description=Ornn daily settlements, after the 4 pm New York settlement
+
+[Timer]
+OnCalendar=*-*-* 16:30:00 America/New_York
+Persistent=true
+Unit=ornn-collector@daily.service
+
+[Install]
+WantedBy=timers.target

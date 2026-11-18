@@ -1,0 +1,10 @@
+[Unit]
+Description=Ornn full history, weekly, to catch late revisions
+
+[Timer]
+OnCalendar=Sun *-*-* 09:40:00
+Persistent=true
+Unit=ornn-collector@backfill.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,11 @@
+[Unit]
+Description=Ornn index collector (%i)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/gpu-price-mix
+EnvironmentFile=-/root/gpu-price-mix/.env
+ExecStart=/root/venv/bin/python3 /root/gpu-price-mix/collectors/ornn/collect_ornn.py %i --root /root/data/ornn
+TimeoutStartSec=600

@@ -1,0 +1,11 @@
+[Unit]
+Description=Ornn current GPU prices, hourly (these cannot be backfilled later)
+
+[Timer]
+OnCalendar=*-*-* *:10:00
+RandomizedDelaySec=120
+Persistent=true
+Unit=ornn-collector@intraday.service
+
+[Install]
+WantedBy=timers.target
