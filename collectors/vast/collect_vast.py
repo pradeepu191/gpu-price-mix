@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """Hourly capture of the full Vast.ai offer market. Capture only, no analysis.
 
-Why paging: Vast caps every search at 512 results, and the market is larger.
-So each market type is read in ascending price order, one page at a time.
-Each page asks for offers priced at or above the most expensive offer on the
-previous page. Overlapping offers at the boundary are removed by offer id.
+Why price bands: Vast caps every search at 512 results, and the market is larger.
+The server's sort order cannot be trusted to give the cheapest 512 (observed for
+on-demand in Nov 2026), so this collector never relies on ordering. It asks for
+explicit price bands, from a lower price up to but not including an upper price.
+A band that returns 512 offers may be truncated, so it is split in half and both
+halves are queried again. A band that returns fewer than 512 offers is complete.
 
 Each run, for each market type (on-demand and bid):
-  - archive every page's raw output, gzipped, byte for byte
-  - append one manifest row per page, including failed pages
+  - archive every query's raw output, gzipped, byte for byte
+  - append one manifest row per query, including failed and truncated ones
   - append one summary row per market type, saying whether the read was complete
 
 Usage:
@@ -21,7 +23,6 @@ import argparse
 import gzip
 import hashlib
 import json
-import math
 import os
 import shutil
 import subprocess
@@ -30,28 +31,47 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-COLLECTOR_VERSION = "vast-0.1.0"
+COLLECTOR_VERSION = "vast-0.2.0"
 PAGE_CAP = 512              # observed server-side cap per search, Nov 2026
-MAX_PAGES = 200             # safety stop, far above what the market needs
+MAX_QUERIES = 400           # safety stop, far above what the market needs
 MARKET_TYPES = ["on-demand", "bid"]
-PRICE_DECIMALS = 6          # boundary prices are floored to this many decimals
+PRICE_DECIMALS = 6          # band edges are rounded to this many decimals
+
+# Starting price bands in $/hour. The last band has no upper limit.
+INITIAL_EDGES = [0.0, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0]
 
 
 def utc_now():
     return datetime.now(timezone.utc)
 
 
-def floor_price(price):
-    """Round a price down, so the next page's lower bound never skips the boundary offer."""
-    scale = 10 ** PRICE_DECIMALS
-    return math.floor(price * scale) / scale
+def initial_bands():
+    """Turn the starting edges into (lower, upper) bands. upper=None means no upper limit."""
+    bands = []
+    for index in range(len(INITIAL_EDGES) - 1):
+        bands.append((INITIAL_EDGES[index], INITIAL_EDGES[index + 1]))
+    bands.append((INITIAL_EDGES[-1], None))
+    return bands
 
 
-def build_query(lower_bound):
-    """Vast query string. rentable=any means free and occupied machines both appear."""
-    if lower_bound is None:
-        return "rentable=any"
-    return f"rentable=any dph_total>={lower_bound:.{PRICE_DECIMALS}f}"
+def split_band(lower, upper):
+    """Split a band that may be truncated. Returns None if it is too narrow to split."""
+    if upper is None:
+        # Open-ended top band: split at double its lower edge
+        middle = round(max(lower * 2, lower + 1.0), PRICE_DECIMALS)
+        return [(lower, middle), (middle, None)]
+    middle = round((lower + upper) / 2, PRICE_DECIMALS)
+    if middle <= lower or middle >= upper:
+        return None
+    return [(lower, middle), (middle, upper)]
+
+
+def build_query(lower, upper):
+    """Vast query for one price band. rentable=any includes free and occupied machines."""
+    query = f"rentable=any dph_total>={lower:.{PRICE_DECIMALS}f}"
+    if upper is not None:
+        query += f" dph_total<{upper:.{PRICE_DECIMALS}f}"
+    return query
 
 
 def run_vast_cli(vastai_path, market_type, query):
@@ -60,7 +80,6 @@ def run_vast_cli(vastai_path, market_type, query):
         vastai_path, "search", "offers", query,
         "--no-default",
         "--type", market_type,
-        "-o", "dph_total",          # ascending price, which the paging depends on
         "--limit", "100000",        # the server applies its own cap
         "--raw",
     ]
@@ -68,38 +87,36 @@ def run_vast_cli(vastai_path, market_type, query):
     return completed.returncode, completed.stdout, completed.stderr.decode("utf-8", "replace")
 
 
-def is_sorted_by_price(offers):
-    """Paging is only correct if the server really returned offers in ascending price order."""
-    for index in range(1, len(offers)):
-        if offers[index]["dph_total"] < offers[index - 1]["dph_total"]:
-            return False
-    return True
-
-
 def read_market(run_query, market_type, page_cap=PAGE_CAP):
-    """Page through one market type. Pure logic, so it can be tested with a fake run_query.
+    """Read one market type band by band. Pure logic, so it can be tested with a fake run_query.
 
     run_query(market_type, query) must return (exit_code, stdout_bytes, stderr_text).
-    Returns (pages, summary). Each page is a dict holding its raw bytes and diagnostics.
+    Returns (pages, summary). Each page is one query's raw bytes plus diagnostics.
     """
     pages = []
     seen_ids = set()
-    lower_bound = None
+    bands = initial_bands()
     status = "complete"
 
-    for page_number in range(MAX_PAGES):
-        query = build_query(lower_bound)
+    while bands:
+        if len(pages) >= MAX_QUERIES:
+            status = "incomplete"
+            break
+
+        lower, upper = bands.pop(0)
+        query = build_query(lower, upper)
         fetched_at = utc_now().isoformat()
         exit_code, stdout, stderr = run_query(market_type, query)
 
         page = {
-            "page": page_number, "query": query, "fetched_at_utc": fetched_at,
-            "exit_code": exit_code, "raw": stdout, "stderr": stderr[:500],
-            "n_offers": None, "n_new": None, "problem": None,
+            "page": len(pages), "query": query, "band_lower": lower, "band_upper": upper,
+            "fetched_at_utc": fetched_at, "exit_code": exit_code, "raw": stdout,
+            "stderr": stderr[:500], "n_offers": None, "n_new": None,
+            "capped": None, "problem": None,
         }
         pages.append(page)
 
-        # A failed or unreadable page ends this market's read, and the failure is recorded
+        # A failed or unreadable query ends this market's read, and the failure is recorded
         if exit_code != 0:
             page["problem"] = "cli_error"
             status = "failed"
@@ -115,7 +132,7 @@ def read_market(run_query, market_type, page_cap=PAGE_CAP):
             status = "failed"
             break
 
-        # Count offers this page adds, after removing boundary overlap
+        # Keep every offer we see, even from a truncated band. Ids remove repeats.
         new_count = 0
         for offer in offers:
             if offer["id"] not in seen_ids:
@@ -123,31 +140,25 @@ def read_market(run_query, market_type, page_cap=PAGE_CAP):
                 new_count += 1
         page["n_offers"] = len(offers)
         page["n_new"] = new_count
+        page["capped"] = len(offers) >= page_cap
 
-        if not is_sorted_by_price(offers):
-            page["problem"] = "unsorted"
-            status = "incomplete"
-            break
+        # Fewer than the cap means this band is complete
+        if not page["capped"]:
+            continue
 
-        # A page below the cap means we reached the most expensive offer
-        if len(offers) < page_cap:
-            break
-
-        # Full page: continue from the highest price seen
-        next_bound = floor_price(offers[-1]["dph_total"])
-        if lower_bound is not None and next_bound <= lower_bound:
-            # 512 or more offers share one price, so price paging cannot move forward
+        # At the cap the band may be truncated, so split it and query both halves
+        halves = split_band(lower, upper)
+        if halves is None:
+            # 512 or more offers inside a band narrower than a millionth of a dollar
             page["problem"] = "tie_overflow"
             status = "incomplete"
-            break
-        lower_bound = next_bound
-    else:
-        status = "incomplete"   # hit MAX_PAGES without reaching the end
+            continue
+        bands = halves + bands
 
     summary = {
         "market_type": market_type,
         "status": status,
-        "pages": len(pages),
+        "queries": len(pages),
         "unique_offers": len(seen_ids),
     }
     return pages, summary
@@ -172,6 +183,8 @@ def archive_market(root, run_id, run_date, market_type, pages, summary):
                 "market_type": market_type,
                 "page": page["page"],
                 "query": page["query"],
+                "band_lower": page["band_lower"],
+                "band_upper": page["band_upper"],
                 "fetched_at_utc": page["fetched_at_utc"],
                 "exit_code": page["exit_code"],
                 "bytes": len(raw_bytes),
@@ -179,6 +192,7 @@ def archive_market(root, run_id, run_date, market_type, pages, summary):
                 "raw_file": str(raw_path.relative_to(root)),
                 "n_offers": page["n_offers"],
                 "n_new": page["n_new"],
+                "capped": page["capped"],
                 "problem": page["problem"],
                 "stderr": page["stderr"],
             }
@@ -227,7 +241,7 @@ def main():
             # Record the crash as a run row, so a gap in the data is explained
             pages = []
             summary = {"market_type": market_type, "status": "crashed",
-                       "pages": 0, "unique_offers": 0, "error": repr(error)[:500]}
+                       "queries": 0, "unique_offers": 0, "error": repr(error)[:500]}
         archive_market(root, run_id, run_date, market_type, pages, summary)
         print(json.dumps(summary))
         if summary["status"] != "complete":
