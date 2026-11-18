@@ -52,7 +52,7 @@ def make_market(prices, cap):
 class BandTests(unittest.TestCase):
     def test_small_market_is_read_completely(self):
         run_query, calls = make_market([0.1, 0.6, 3.0, 70.0], cap=4)
-        pages, summary = collect_vast.read_market(run_query, "on-demand", page_cap=4)
+        pages, summary = collect_vast.read_market(run_query, "on-demand", models=["H100 SXM"], page_cap=4)
         self.assertEqual(summary["status"], "complete")
         self.assertEqual(summary["unique_offers"], 4)
 
@@ -62,7 +62,7 @@ class BandTests(unittest.TestCase):
         for _ in range(300):
             prices.append(round(generator.uniform(0.0, 0.25), 4))
         run_query, calls = make_market(prices, cap=16)
-        pages, summary = collect_vast.read_market(run_query, "on-demand", page_cap=16)
+        pages, summary = collect_vast.read_market(run_query, "on-demand", models=["H100 SXM"], page_cap=16)
         self.assertEqual(summary["status"], "complete")
         self.assertEqual(summary["unique_offers"], len(prices))
 
@@ -71,7 +71,7 @@ class BandTests(unittest.TestCase):
         for index in range(40):
             prices.append(70.0 + index)
         run_query, calls = make_market(prices, cap=8)
-        pages, summary = collect_vast.read_market(run_query, "on-demand", page_cap=8)
+        pages, summary = collect_vast.read_market(run_query, "on-demand", models=["H100 SXM"], page_cap=8)
         self.assertEqual(summary["status"], "complete")
         self.assertEqual(summary["unique_offers"], 40)
 
@@ -82,13 +82,13 @@ class BandTests(unittest.TestCase):
         for _ in range(1000):
             prices.append(round(generator.uniform(0.0, 10.0), 4))
         run_query, calls = make_market(prices, cap=50)
-        pages, summary = collect_vast.read_market(run_query, "on-demand", page_cap=50)
+        pages, summary = collect_vast.read_market(run_query, "on-demand", models=["H100 SXM"], page_cap=50)
         self.assertEqual(summary["unique_offers"], len(set(range(1000))))
 
     def test_identical_prices_beyond_cap_are_flagged_not_hidden(self):
         prices = [1.5] * 10
         run_query, calls = make_market(prices, cap=4)
-        pages, summary = collect_vast.read_market(run_query, "on-demand", page_cap=4)
+        pages, summary = collect_vast.read_market(run_query, "on-demand", models=["H100 SXM"], page_cap=4)
         self.assertEqual(summary["status"], "incomplete")
         problems = []
         for page in pages:
@@ -98,7 +98,7 @@ class BandTests(unittest.TestCase):
     def test_cli_failure_is_recorded_and_archived(self):
         def run_query(market_type, query):
             return 1, b"", "boom"
-        pages, summary = collect_vast.read_market(run_query, "bid", page_cap=4)
+        pages, summary = collect_vast.read_market(run_query, "bid", models=["H100 SXM"], page_cap=4)
         self.assertEqual(summary["status"], "failed")
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -111,7 +111,32 @@ class BandTests(unittest.TestCase):
     def test_band_edges_do_not_overlap(self):
         halves = collect_vast.split_band(1.0, 2.0)
         self.assertEqual(halves[0][1], halves[1][0])
-        self.assertEqual(collect_vast.build_query(1.0, 1.5), "rentable=any dph_total>=1.000000 dph_total<1.500000")
+        self.assertEqual(
+            collect_vast.build_query("H100 SXM", 1.0, 1.5),
+            "rentable=any gpu_name=H100_SXM dph_total>=1.000000 dph_total<1.500000",
+        )
+        self.assertEqual(collect_vast.build_query("H100 SXM", None, None), "rentable=any gpu_name=H100_SXM")
+
+    def test_quota_error_stops_the_read(self):
+        calls = []
+        def run_query(market_type, query):
+            calls.append(query)
+            body = {"error": True, "status_code": 429, "msg": "Daily search row quota exhausted."}
+            return 0, json.dumps(body).encode(), ""
+        pages, summary = collect_vast.read_market(run_query, "on-demand", models=["H100 SXM", "B200"], page_cap=4)
+        self.assertEqual(summary["status"], "quota_exhausted")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(pages[0]["problem"], "quota_exhausted")
+
+    def test_rows_returned_counts_every_row_fetched(self):
+        prices = []
+        for index in range(10):
+            prices.append(0.5 + index)
+        run_query, calls = make_market(prices, cap=4)
+        pages, summary = collect_vast.read_market(run_query, "on-demand", models=["H100 SXM"], page_cap=4)
+        self.assertEqual(summary["status"], "complete")
+        self.assertEqual(summary["unique_offers"], 10)
+        self.assertGreaterEqual(summary["rows_returned"], 10)
 
 
 if __name__ == "__main__":

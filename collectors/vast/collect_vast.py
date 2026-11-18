@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """Hourly capture of the full Vast.ai offer market. Capture only, no analysis.
 
-Why price bands: Vast caps every search at 512 results, and the market is larger.
-The server's sort order cannot be trusted to give the cheapest 512 (observed for
-on-demand in Nov 2026), so this collector never relies on ordering. It asks for
-explicit price bands, from a lower price up to but not including an upper price.
-A band that returns 512 offers may be truncated, so it is split in half and both
-halves are queried again. A band that returns fewer than 512 offers is complete.
+Scope: datacenter GPU models only, the hardware that GPU price indices cover.
+Vast enforces a daily quota on search rows, so the whole market (thousands of
+consumer cards) cannot be captured every hour, and is not needed.
 
-Each run, for each market type (on-demand and bid):
+Why price bands: Vast caps every search at 512 results. The server's sort order
+cannot be trusted to give the cheapest 512 (observed for on-demand in Nov 2026),
+so the collector never relies on ordering. Each model is queried once. If that
+query returns 512 offers it may be truncated, so it is split into price bands,
+from a lower price up to but not including an upper price, and each band is
+queried again. A query that returns fewer than 512 offers is complete.
+
+Each run, for each market type:
   - archive every query's raw output, gzipped, byte for byte
   - append one manifest row per query, including failed and truncated ones
   - append one summary row per market type, saying whether the read was complete
@@ -31,31 +35,31 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-COLLECTOR_VERSION = "vast-0.2.0"
+COLLECTOR_VERSION = "vast-0.3.0"
 PAGE_CAP = 512              # observed server-side cap per search, Nov 2026
-MAX_QUERIES = 400           # safety stop, far above what the market needs
-MARKET_TYPES = ["on-demand", "bid"]
+MAX_QUERIES = 200           # safety stop per market type
 PRICE_DECIMALS = 6          # band edges are rounded to this many decimals
+BID_EVERY_HOURS = 6         # the interruptible market is captured less often, to save quota
 
-# Starting price bands in $/hour. The last band has no upper limit.
-INITIAL_EDGES = [0.0, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0]
+# Exact names as Vast spells them (public pricing feed, Nov 2026).
+# The search syntax wants underscores in place of spaces.
+GPU_MODELS = [
+    "A100 PCIE", "A100 SXM4",
+    "H100 PCIE", "H100 SXM", "H100 NVL",
+    "H200", "H200 NVL",
+    "B200", "B300", "GB200",
+    "L40S",
+]
 
 
 def utc_now():
     return datetime.now(timezone.utc)
 
 
-def initial_bands():
-    """Turn the starting edges into (lower, upper) bands. upper=None means no upper limit."""
-    bands = []
-    for index in range(len(INITIAL_EDGES) - 1):
-        bands.append((INITIAL_EDGES[index], INITIAL_EDGES[index + 1]))
-    bands.append((INITIAL_EDGES[-1], None))
-    return bands
-
-
 def split_band(lower, upper):
     """Split a band that may be truncated. Returns None if it is too narrow to split."""
+    if lower is None:
+        lower = 0.0
     if upper is None:
         # Open-ended top band: split at double its lower edge
         middle = round(max(lower * 2, lower + 1.0), PRICE_DECIMALS)
@@ -66,12 +70,20 @@ def split_band(lower, upper):
     return [(lower, middle), (middle, upper)]
 
 
-def build_query(lower, upper):
-    """Vast query for one price band. rentable=any includes free and occupied machines."""
-    query = f"rentable=any dph_total>={lower:.{PRICE_DECIMALS}f}"
+def build_query(model, lower, upper):
+    """Vast query for one GPU model, optionally inside a price band.
+    rentable=any includes free and occupied machines."""
+    query = "rentable=any gpu_name=" + model.replace(" ", "_")
+    if lower is not None:
+        query += f" dph_total>={lower:.{PRICE_DECIMALS}f}"
     if upper is not None:
         query += f" dph_total<{upper:.{PRICE_DECIMALS}f}"
     return query
+
+
+def is_quota_error(parsed):
+    """Vast answers an exhausted daily quota with a JSON object carrying status_code 429."""
+    return isinstance(parsed, dict) and parsed.get("status_code") == 429
 
 
 def run_vast_cli(vastai_path, market_type, query):
@@ -87,29 +99,35 @@ def run_vast_cli(vastai_path, market_type, query):
     return completed.returncode, completed.stdout, completed.stderr.decode("utf-8", "replace")
 
 
-def read_market(run_query, market_type, page_cap=PAGE_CAP):
-    """Read one market type band by band. Pure logic, so it can be tested with a fake run_query.
+def read_market(run_query, market_type, models=GPU_MODELS, page_cap=PAGE_CAP):
+    """Read one market type, model by model. Pure logic, so it can be tested with a fake run_query.
 
     run_query(market_type, query) must return (exit_code, stdout_bytes, stderr_text).
     Returns (pages, summary). Each page is one query's raw bytes plus diagnostics.
     """
     pages = []
     seen_ids = set()
-    bands = initial_bands()
+    rows_returned = 0
     status = "complete"
 
-    while bands:
+    # Work list of (model, lower, upper). No band at first: one query per model.
+    work = []
+    for model in models:
+        work.append((model, None, None))
+
+    while work:
         if len(pages) >= MAX_QUERIES:
             status = "incomplete"
             break
 
-        lower, upper = bands.pop(0)
-        query = build_query(lower, upper)
+        model, lower, upper = work.pop(0)
+        query = build_query(model, lower, upper)
         fetched_at = utc_now().isoformat()
         exit_code, stdout, stderr = run_query(market_type, query)
 
         page = {
-            "page": len(pages), "query": query, "band_lower": lower, "band_upper": upper,
+            "page": len(pages), "query": query, "model": model,
+            "band_lower": lower, "band_upper": upper,
             "fetched_at_utc": fetched_at, "exit_code": exit_code, "raw": stdout,
             "stderr": stderr[:500], "n_offers": None, "n_new": None,
             "capped": None, "problem": None,
@@ -127,6 +145,11 @@ def read_market(run_query, market_type, page_cap=PAGE_CAP):
             page["problem"] = "not_json"
             status = "failed"
             break
+        if is_quota_error(offers):
+            # Stop immediately. Further queries would only fail too.
+            page["problem"] = "quota_exhausted"
+            status = "quota_exhausted"
+            break
         if not isinstance(offers, list):
             page["problem"] = "not_a_list"
             status = "failed"
@@ -140,6 +163,7 @@ def read_market(run_query, market_type, page_cap=PAGE_CAP):
                 new_count += 1
         page["n_offers"] = len(offers)
         page["n_new"] = new_count
+        rows_returned += len(offers)
         page["capped"] = len(offers) >= page_cap
 
         # Fewer than the cap means this band is complete
@@ -153,12 +177,14 @@ def read_market(run_query, market_type, page_cap=PAGE_CAP):
             page["problem"] = "tie_overflow"
             status = "incomplete"
             continue
-        bands = halves + bands
+        for half_lower, half_upper in reversed(halves):
+            work.insert(0, (model, half_lower, half_upper))
 
     summary = {
         "market_type": market_type,
         "status": status,
         "queries": len(pages),
+        "rows_returned": rows_returned,
         "unique_offers": len(seen_ids),
     }
     return pages, summary
@@ -183,6 +209,7 @@ def archive_market(root, run_id, run_date, market_type, pages, summary):
                 "market_type": market_type,
                 "page": page["page"],
                 "query": page["query"],
+                "model": page["model"],
                 "band_lower": page["band_lower"],
                 "band_upper": page["band_upper"],
                 "fetched_at_utc": page["fetched_at_utc"],
@@ -223,6 +250,7 @@ def main():
     parser = argparse.ArgumentParser(description="Hourly Vast.ai offer snapshot")
     parser.add_argument("--root", type=Path, default=Path("data"), help="data directory, kept out of git")
     parser.add_argument("--vastai", default=shutil.which("vastai") or "vastai", help="path to the vastai CLI")
+    parser.add_argument("--force-bid", action="store_true", help="also capture the bid market this run")
     args = parser.parse_args()
 
     started = utc_now()
@@ -233,8 +261,13 @@ def main():
     def run_query(market_type, query):
         return run_vast_cli(args.vastai, market_type, query)
 
+    # On-demand every run. The interruptible (bid) market only every few hours.
+    market_types = ["on-demand"]
+    if started.hour % BID_EVERY_HOURS == 0 or args.force_bid:
+        market_types.append("bid")
+
     all_ok = True
-    for market_type in MARKET_TYPES:
+    for market_type in market_types:
         try:
             pages, summary = read_market(run_query, market_type)
         except Exception as error:
@@ -246,6 +279,8 @@ def main():
         print(json.dumps(summary))
         if summary["status"] != "complete":
             all_ok = False
+        if summary["status"] == "quota_exhausted":
+            break
 
     ping_healthcheck(all_ok)
     sys.exit(0 if all_ok else 1)
