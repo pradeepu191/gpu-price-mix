@@ -1,0 +1,12 @@
+[Unit]
+Description=Hourly Vast.ai offer snapshot
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/gpu-price-mix
+Environment=HOME=/root
+EnvironmentFile=-/root/gpu-price-mix/.env
+ExecStart=/root/venv/bin/python3 /root/gpu-price-mix/collectors/vast/collect_vast.py --root /root/data --vastai /root/venv/bin/vastai
+TimeoutStartSec=1200

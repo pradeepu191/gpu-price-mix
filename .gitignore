@@ -221,3 +221,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# research data stays private
+data/
+*.gz
+*.sqlite
+*.parquet
