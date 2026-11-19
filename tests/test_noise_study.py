@@ -47,6 +47,32 @@ class FormulaTests(unittest.TestCase):
         self.assertEqual(noise_study.weighted_quantile(rentals, 0.5), 5.0)
 
 
+class SmoothQuantileTests(unittest.TestCase):
+    def test_smooth_quantile_stays_inside_the_price_range(self):
+        rentals = [(1.0, 1), (2.0, 3), (4.0, 1)]
+        for share in (0.0, 0.05, 0.3, 0.5, 0.9, 1.0):
+            value = noise_study.weighted_quantile(rentals, share, "smooth")
+            self.assertGreaterEqual(value, 1.0)
+            self.assertLessEqual(value, 4.0)
+
+    def test_smooth_quantile_rises_with_share(self):
+        rentals = [(1.0, 2), (2.0, 1), (3.0, 5), (7.0, 1)]
+        previous = None
+        for step in range(11):
+            value = noise_study.weighted_quantile(rentals, step / 10, "smooth")
+            if previous is not None:
+                self.assertGreaterEqual(value, previous)
+            previous = value
+
+    def test_smooth_quantile_of_equal_weights_is_the_middle(self):
+        rentals = [(1.0, 1), (3.0, 1)]
+        self.assertAlmostEqual(noise_study.weighted_quantile(rentals, 0.5, "smooth"), 2.0)
+
+    def test_constant_prices_give_that_price_with_smooth_cutoffs(self):
+        rentals = [(2.5, 1), (2.5, 8)]
+        self.assertAlmostEqual(noise_study.winsorized_weighted_mean(rentals, 0.1, "smooth"), 2.5)
+
+
 class SimulationTests(unittest.TestCase):
     def test_more_rentals_means_less_chance_error(self):
         rng = random.Random(0)
@@ -62,6 +88,7 @@ class SimulationTests(unittest.TestCase):
         result = noise_study.simulate(rentals, 3, 0.05, 200, random.Random(2))
         self.assertAlmostEqual(result["p05"], 0.0)
         self.assertAlmostEqual(result["p95"], 0.0)
+        self.assertAlmostEqual(result["bias"], 0.0)
 
 
 if __name__ == "__main__":

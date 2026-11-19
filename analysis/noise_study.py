@@ -40,30 +40,56 @@ import vast_data  # noqa: E402
 
 RENTAL_COUNTS = [1, 2, 3, 5, 8, 13, 20, 30, 50, 80, 130, 200]
 CUTOFFS = [0.0, 0.05, 0.10]     # share of GPU weight pulled in from each tail
-CHART_CUTOFF = 0.05             # the one cutoff drawn on the chart
+QUANTILE_METHODS = ["step", "smooth"]
+CHART_CUTOFF = 0.0              # the chart shows the plain GPU-weighted average
 
 
-def weighted_quantile(rentals, share):
+def weighted_quantile(rentals, share, method="step"):
     """Price below which `share` of the total GPU weight sits.
 
-    rentals is a list of (price, gpu_count). Walk up the sorted prices,
-    adding GPU counts, and stop once the running total reaches the share.
+    rentals is a list of (price, gpu_count).
+    step:   walk up the sorted prices adding GPU counts, and stop at the first
+            price where the running total reaches the share. Jumps from one
+            offer's price to the next.
+    smooth: place each offer at the middle of its slice of GPU weight and draw
+            straight lines between offers, so the answer moves gradually.
     """
     ordered = sorted(rentals)
     total_weight = 0
     for price, weight in ordered:
         total_weight += weight
-    target = share * total_weight
 
+    if method == "step":
+        target = share * total_weight
+        running = 0
+        for price, weight in ordered:
+            running += weight
+            if running >= target:
+                return price
+        return ordered[-1][0]
+
+    # smooth: each offer sits at the midpoint of its weight slice, from 0 to 1
+    positions = []
     running = 0
     for price, weight in ordered:
+        positions.append(((running + weight / 2) / total_weight, price))
         running += weight
-        if running >= target:
-            return price
-    return ordered[-1][0]
+    if share <= positions[0][0]:
+        return positions[0][1]
+    if share >= positions[-1][0]:
+        return positions[-1][1]
+    for index in range(1, len(positions)):
+        left_position, left_price = positions[index - 1]
+        right_position, right_price = positions[index]
+        if share <= right_position:
+            if right_position == left_position:
+                return right_price
+            fraction = (share - left_position) / (right_position - left_position)
+            return left_price + fraction * (right_price - left_price)
+    return positions[-1][1]
 
 
-def winsorized_weighted_mean(rentals, cutoff):
+def winsorized_weighted_mean(rentals, cutoff, method="step"):
     """Average price weighted by GPU count, after pulling extreme prices in.
 
     Prices below the `cutoff` quantile are raised to it, and prices above the
@@ -71,8 +97,8 @@ def winsorized_weighted_mean(rentals, cutoff):
     cutoff 0 this is the plain GPU-weighted average.
     """
     if cutoff > 0:
-        low = weighted_quantile(rentals, cutoff)
-        high = weighted_quantile(rentals, 1 - cutoff)
+        low = weighted_quantile(rentals, cutoff, method)
+        high = weighted_quantile(rentals, 1 - cutoff, method)
     else:
         low = None
         high = None
@@ -96,24 +122,57 @@ def percentile(sorted_values, share):
     return sorted_values[index]
 
 
-def simulate(rentals, rental_count, cutoff, repeats, rng):
-    """Relative error of the index on N random rentals, versus the whole snapshot."""
-    true_value = winsorized_weighted_mean(rentals, cutoff)
+def simulate(rentals, rental_count, cutoff, repeats, rng, method="step"):
+    """Relative error of the index on N random rentals, versus the whole snapshot.
+
+    bias is the average error: a thin hour that leans high or low on average.
+    p05 to p95 is the range holding 90% of chance outcomes.
+    """
+    true_value = winsorized_weighted_mean(rentals, cutoff, method)
     errors = []
     for _ in range(repeats):
         sample = []
         for _ in range(rental_count):
             sample.append(rng.choice(rentals))
-        estimate = winsorized_weighted_mean(sample, cutoff)
+        estimate = winsorized_weighted_mean(sample, cutoff, method)
         errors.append(estimate / true_value - 1)
     errors.sort()
+    absolute_errors = []
+    for error in errors:
+        absolute_errors.append(abs(error))
     return {
         "true_value": true_value,
+        "bias": statistics.fmean(errors),
         "p05": percentile(errors, 0.05),
         "p50": percentile(errors, 0.50),
         "p95": percentile(errors, 0.95),
-        "typical_abs": statistics.median(abs(error) for error in errors),
+        "typical_abs": statistics.median(absolute_errors),
     }
+
+
+def describe_tails(rentals, cutoff, method):
+    """Show where the cutoffs land and which offers they pull in, to see if the tails are clumpy."""
+    low = weighted_quantile(rentals, cutoff, method)
+    high = weighted_quantile(rentals, 1 - cutoff, method)
+    total_weight = 0
+    for price, weight in rentals:
+        total_weight += weight
+    above = []
+    below = []
+    for price, weight in sorted(rentals):
+        if price >= high:
+            above.append((round(price, 2), weight))
+        if price <= low:
+            below.append((round(price, 2), weight))
+    above_weight = 0
+    for price, weight in above:
+        above_weight += weight
+    below_weight = 0
+    for price, weight in below:
+        below_weight += weight
+    print(f"  {method:6} cutoff {cutoff:.2f}: pull-in range ${low:.2f} to ${high:.2f}")
+    print(f"     at or below ${low:.2f}: {len(below)} offers, {100 * below_weight / total_weight:.1f}% of GPUs {below[:6]}")
+    print(f"     at or above ${high:.2f}: {len(above)} offers, {100 * above_weight / total_weight:.1f}% of GPUs {above[-8:]}")
 
 
 def describe(name, rentals):
@@ -147,7 +206,7 @@ def draw_chart(rows, model, population_label, out_path):
 
     chart_rows = []
     for row in rows:
-        if row["cutoff"] == CHART_CUTOFF:
+        if row["cutoff"] == CHART_CUTOFF and row["method"] == "step":
             chart_rows.append(row)
     counts = []
     lows = []
@@ -179,8 +238,11 @@ def draw_chart(rows, model, population_label, out_path):
     ax.yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(signed_percent))
     fig.text(0.012, 0.965, f"How far an hourly {model} price can move with no real price change",
              color=ink, fontsize=11.5, weight="bold", va="top")
-    fig.text(0.012, 0.905, f"90% of chance outcomes fall inside the band. {population_label}. "
-             f"The most extreme {int(CHART_CUTOFF * 100)}% of prices on each side are pulled in.",
+    if CHART_CUTOFF > 0:
+        cutoff_note = f"The most extreme {int(CHART_CUTOFF * 100)}% of prices on each side are pulled in."
+    else:
+        cutoff_note = "Plain average weighted by GPU count."
+    fig.text(0.012, 0.905, f"90% of chance outcomes fall inside the band. {population_label}. {cutoff_note}",
              color=ink_secondary, fontsize=8.5, va="top")
 
     ax.grid(axis="y", color="#e6e5e0", linewidth=0.6)
@@ -233,19 +295,30 @@ def main():
     print(f"occupied (rentable=False): {occupied_count}")
     describe("population", rentals)
 
-    rng = random.Random(args.seed)
-    rows = []
-    for cutoff in CUTOFFS:
-        for count in RENTAL_COUNTS:
-            result = simulate(rentals, count, cutoff, args.repeats, rng)
-            row = {"cutoff": cutoff, "rentals_per_hour": count}
-            row.update(result)
-            rows.append(row)
+    print("\nwhere the cutoffs land:")
+    for method in QUANTILE_METHODS:
+        for cutoff in CUTOFFS:
+            if cutoff > 0:
+                describe_tails(rentals, cutoff, method)
 
-    print("\ncutoff  rentals   5th pct   95th pct   typical |error|")
+    rows = []
+    for method in QUANTILE_METHODS:
+        for cutoff in CUTOFFS:
+            if cutoff == 0 and method != "step":
+                continue   # with no cutoff the method makes no difference
+            for count in RENTAL_COUNTS:
+                # same random draws for every setting, so differences come from the method
+                rng = random.Random(args.seed + count)
+                result = simulate(rentals, count, cutoff, args.repeats, rng, method)
+                row = {"method": method, "cutoff": cutoff, "rentals_per_hour": count}
+                row.update(result)
+                rows.append(row)
+
+    print("\nmethod cutoff  rentals    bias   5th pct   median  95th pct   typical |error|")
     for row in rows:
-        print(f"{row['cutoff']:6.2f}  {row['rentals_per_hour']:7d}  {100 * row['p05']:+7.1f}%  "
-              f"{100 * row['p95']:+8.1f}%  {100 * row['typical_abs']:10.1f}%")
+        print(f"{row['method']:6} {row['cutoff']:6.2f}  {row['rentals_per_hour']:7d}  {100 * row['bias']:+5.1f}%  "
+              f"{100 * row['p05']:+7.1f}%  {100 * row['p50']:+6.1f}%  {100 * row['p95']:+7.1f}%  "
+              f"{100 * row['typical_abs']:10.1f}%")
 
     args.out.mkdir(parents=True, exist_ok=True)
     tag = f"{args.model.replace(' ', '_')}_{run_id}{'_occupied' if args.occupied_only else ''}"
