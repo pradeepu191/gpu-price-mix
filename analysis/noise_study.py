@@ -23,8 +23,18 @@ What this does and does not show
   It is NOT an estimate of OCPI's own error: Vast's asking prices are not the
   rentals Ornn sees, and Ornn's rental counts per hour are not public.
 
+Clustered rentals
+  The simulation treats every rental as an independent pick. If renters often
+  take several machines from one host at once, at one price, the picks are not
+  independent: 20 rentals in clusters of 4 behave like 5 independent picks, so
+  read the curve at 5. The script reports how clustered the sellers are
+  ("price points": distinct host and price pairs) to judge how much this matters.
+
 Usage (on the droplet, reads only archived files, uses no Vast quota)
-  python3 analysis/noise_study.py --root /root/data --model "H100 SXM" --out /root/data/analysis
+  One snapshot, full tables and chart:
+    python3 analysis/noise_study.py --root /root/data --model "H100 SXM"
+  Every snapshot so far, a few headline numbers each, to see if they hold up:
+    python3 analysis/noise_study.py --root /root/data --model "H100 SXM" --all-runs
 """
 
 import argparse
@@ -257,43 +267,124 @@ def draw_chart(rows, model, population_label, out_path):
     print(f"chart: {out_path}")
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__.split("\n")[1])
-    parser.add_argument("--root", type=Path, default=Path("/root/data"))
-    parser.add_argument("--model", default="H100 SXM")
-    parser.add_argument("--market", default="on-demand")
-    parser.add_argument("--run-id", default=None, help="defaults to the newest complete run")
-    parser.add_argument("--repeats", type=int, default=20000)
-    parser.add_argument("--seed", type=int, default=7)
-    parser.add_argument("--occupied-only", action="store_true",
-                        help="use only machines currently rented, the closest thing to real rentals")
-    parser.add_argument("--out", type=Path, default=Path("/root/data/analysis"))
-    args = parser.parse_args()
-
-    run_id = args.run_id or vast_data.latest_complete_run(args.root, args.market)
-    offers = vast_data.load_offers(args.root, args.market, run_id)
-
-    rentals = []
+def select_offers(offers, model, occupied_only):
+    """Usable offers for one GPU model. Returns (selected, occupied_count)."""
+    selected = []
     occupied_count = 0
     for offer in offers:
-        if offer["gpu_name"] != args.model:
+        if offer["gpu_name"] != model:
             continue
         if offer["num_gpus"] <= 0 or offer["dph_base"] is None:
             continue
         occupied = vast_data.is_occupied(offer)
         if occupied:
             occupied_count += 1
-        if args.occupied_only and not occupied:
+        if occupied_only and not occupied:
             continue
-        rentals.append((vast_data.price_per_gpu_hour(offer), offer["num_gpus"]))
+        selected.append(offer)
+    return selected, occupied_count
 
-    if len(rentals) < 10:
-        sys.exit(f"Only {len(rentals)} usable {args.model} offers in run {run_id}; too few to study.")
+
+def offer_rentals(offers):
+    """One (price per GPU-hour, GPU count) per offer."""
+    rentals = []
+    for offer in offers:
+        rentals.append((vast_data.price_per_gpu_hour(offer), offer["num_gpus"]))
+    return rentals
+
+
+def price_points(offers):
+    """Distinct (host, price) pairs. Offers sharing one are likely priced, and maybe rented, together."""
+    points = set()
+    for offer in offers:
+        points.add((offer["host_id"], round(vast_data.price_per_gpu_hour(offer), 4)))
+    return len(points)
+
+
+def largest_host_share(offers):
+    """Share of all GPUs listed by the single biggest host."""
+    gpus_by_host = {}
+    total = 0
+    for offer in offers:
+        gpus_by_host[offer["host_id"]] = gpus_by_host.get(offer["host_id"], 0) + offer["num_gpus"]
+        total += offer["num_gpus"]
+    return max(gpus_by_host.values()) / total
+
+
+def gpu_count_of_host(item):
+    """Sort key: a (host, info) pair ranked by how many GPUs that host lists."""
+    return item[1]["gpus"]
+
+
+def describe_hosts(offers):
+    """Who sells: how concentrated the listings are, and whether hosts price all machines alike."""
+    by_host = {}
+    total_gpus = 0
+    for offer in offers:
+        host = offer["host_id"]
+        if host not in by_host:
+            by_host[host] = {"offers": 0, "gpus": 0, "prices": set()}
+        by_host[host]["offers"] += 1
+        by_host[host]["gpus"] += offer["num_gpus"]
+        by_host[host]["prices"].add(round(vast_data.price_per_gpu_hour(offer), 2))
+        total_gpus += offer["num_gpus"]
+
+    ranked = sorted(by_host.items(), key=gpu_count_of_host, reverse=True)
+    points = price_points(offers)
+    print(f"\nwho sells: {len(by_host)} hosts, {points} distinct host-and-price points, {len(offers)} offers")
+    print(f"  average offers per price point: {len(offers) / points:.1f} "
+          f"(if renters take a whole point at once, divide rentals per hour by this)")
+    print("  host        offers  GPUs  share  distinct prices")
+    for host, info in ranked[:8]:
+        prices = sorted(info["prices"])
+        shown = ", ".join(f"${price:.2f}" for price in prices[:5])
+        print(f"  {host:<10}  {info['offers']:6d}  {info['gpus']:4d}  {100 * info['gpus'] / total_gpus:4.0f}%  {shown}")
+
+
+def price_shape(rentals):
+    """Simple description of the price spread, weighted by GPUs."""
+    lowest = min(price for price, weight in rentals)
+    total = 0
+    near_floor = 0
+    for price, weight in rentals:
+        total += weight
+        if price <= lowest * 1.01:
+            near_floor += weight
+    return {
+        "p10": weighted_quantile(rentals, 0.10),
+        "p50": weighted_quantile(rentals, 0.50),
+        "p90": weighted_quantile(rentals, 0.90),
+        "floor_share": near_floor / total,
+    }
+
+
+def print_rows(rows):
+    print("\nmethod cutoff  rentals    bias   5th pct   median  95th pct   typical |error|")
+    for row in rows:
+        print(f"{row['method']:6} {row['cutoff']:6.2f}  {row['rentals_per_hour']:7d}  {100 * row['bias']:+5.1f}%  "
+              f"{100 * row['p05']:+7.1f}%  {100 * row['p50']:+6.1f}%  {100 * row['p95']:+7.1f}%  "
+              f"{100 * row['typical_abs']:10.1f}%")
+
+
+def write_csv(rows, path):
+    with open(path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def run_single(args, run_id):
+    all_offers = vast_data.load_offers(args.root, args.market, run_id)
+    offers, occupied_count = select_offers(all_offers, args.model, args.occupied_only)
+    if len(offers) < 10:
+        sys.exit(f"Only {len(offers)} usable {args.model} offers in run {run_id}; too few to study.")
+    rentals = offer_rentals(offers)
 
     population_label = "Occupied machines only" if args.occupied_only else "All listed offers"
     print(f"run {run_id}, {args.market}, {args.model}, {population_label.lower()}")
     print(f"occupied (rentable=False): {occupied_count}")
     describe("population", rentals)
+    describe_hosts(offers)
 
     print("\nwhere the cutoffs land:")
     for method in QUANTILE_METHODS:
@@ -313,22 +404,107 @@ def main():
                 row = {"method": method, "cutoff": cutoff, "rentals_per_hour": count}
                 row.update(result)
                 rows.append(row)
-
-    print("\nmethod cutoff  rentals    bias   5th pct   median  95th pct   typical |error|")
-    for row in rows:
-        print(f"{row['method']:6} {row['cutoff']:6.2f}  {row['rentals_per_hour']:7d}  {100 * row['bias']:+5.1f}%  "
-              f"{100 * row['p05']:+7.1f}%  {100 * row['p50']:+6.1f}%  {100 * row['p95']:+7.1f}%  "
-              f"{100 * row['typical_abs']:10.1f}%")
+    print_rows(rows)
 
     args.out.mkdir(parents=True, exist_ok=True)
     tag = f"{args.model.replace(' ', '_')}_{run_id}{'_occupied' if args.occupied_only else ''}"
     csv_path = args.out / f"noise_{tag}.csv"
-    with open(csv_path, "w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(rows)
+    write_csv(rows, csv_path)
     print(f"\ntable: {csv_path}")
     draw_chart(rows, args.model, population_label, args.out / f"noise_{tag}.png")
+
+
+def run_all(args):
+    """A few headline numbers for every complete snapshot, to see whether they hold up."""
+    run_ids = vast_data.complete_runs(args.root, args.market)
+    rows = []
+    for run_id in run_ids:
+        all_offers = vast_data.load_offers(args.root, args.market, run_id)
+        offers, occupied_count = select_offers(all_offers, args.model, args.occupied_only)
+        if len(offers) < 10:
+            print(f"{run_id}: only {len(offers)} offers, skipped")
+            continue
+        rentals = offer_rentals(offers)
+        shape = price_shape(rentals)
+        gpu_total = 0
+        for price, weight in rentals:
+            gpu_total += weight
+
+        plain_20 = simulate(rentals, 20, 0.0, args.repeats, random.Random(args.seed), "step")
+        plain_3 = simulate(rentals, 3, 0.0, args.repeats, random.Random(args.seed), "step")
+        cut10_20 = simulate(rentals, 20, 0.10, args.repeats, random.Random(args.seed), "step")
+
+        rows.append({
+            "run_id": run_id,
+            "offers": len(offers),
+            "gpus": gpu_total,
+            "hosts": len(set(offer["host_id"] for offer in offers)),
+            "price_points": price_points(offers),
+            "largest_host_share": largest_host_share(offers),
+            "occupied_share": occupied_count / len(offers),
+            "price_p10": shape["p10"],
+            "price_p50": shape["p50"],
+            "price_p90": shape["p90"],
+            "floor_share": shape["floor_share"],
+            "band20_low": plain_20["p05"],
+            "band20_high": plain_20["p95"],
+            "median_error_3": plain_3["p50"],
+            "cut10_bias_20": cut10_20["bias"],
+        })
+
+    if not rows:
+        sys.exit("No usable snapshots yet.")
+
+    print(f"{len(rows)} snapshots of {args.model}, {args.market}\n")
+    print("run_id            offers hosts points top-host occ%  p50 price floor%   band @20 rentals   "
+          "median@3  lean@cut10")
+    for row in rows:
+        print(f"{row['run_id']}  {row['offers']:5d} {row['hosts']:5d} {row['price_points']:6d}"
+              f"    {100 * row['largest_host_share']:4.0f}% {100 * row['occupied_share']:4.0f}%"
+              f"   ${row['price_p50']:5.2f}  {100 * row['floor_share']:4.0f}%"
+              f"   {100 * row['band20_low']:+5.1f}% {100 * row['band20_high']:+5.1f}%"
+              f"     {100 * row['median_error_3']:+5.1f}%    {100 * row['cut10_bias_20']:+5.1f}%")
+
+    print("\nacross snapshots (min / median / max):")
+    for key in ("band20_low", "band20_high", "median_error_3", "cut10_bias_20",
+                "floor_share", "largest_host_share"):
+        values = []
+        for row in rows:
+            values.append(row[key])
+        values.sort()
+        print(f"  {key:18} {100 * values[0]:+6.1f}%  {100 * statistics.median(values):+6.1f}%  {100 * values[-1]:+6.1f}%")
+
+    args.out.mkdir(parents=True, exist_ok=True)
+    csv_path = args.out / f"noise_by_snapshot_{args.model.replace(' ', '_')}.csv"
+    write_csv(rows, csv_path)
+    print(f"\ntable: {csv_path}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.split("\n")[1])
+    parser.add_argument("--root", type=Path, default=Path("/root/data"))
+    parser.add_argument("--model", default="H100 SXM")
+    parser.add_argument("--market", default="on-demand")
+    parser.add_argument("--run-id", default=None, help="defaults to the newest complete run")
+    parser.add_argument("--all-runs", action="store_true", help="summarize every complete snapshot")
+    parser.add_argument("--repeats", type=int, default=None,
+                        help="random repeats per setting (default 20000, or 4000 with --all-runs)")
+    parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--occupied-only", action="store_true",
+                        help="use only machines currently rented, the closest thing to real rentals")
+    parser.add_argument("--out", type=Path, default=Path("/root/data/analysis"))
+    args = parser.parse_args()
+
+    if args.all_runs:
+        if args.repeats is None:
+            args.repeats = 4000
+        run_all(args)
+        return
+
+    if args.repeats is None:
+        args.repeats = 20000
+    run_id = args.run_id or vast_data.latest_complete_run(args.root, args.market)
+    run_single(args, run_id)
 
 
 if __name__ == "__main__":

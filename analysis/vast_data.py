@@ -27,6 +27,18 @@ def latest_complete_run(root, market_type):
     return latest
 
 
+def complete_runs(root, market_type):
+    """Every run_id whose read of this market was complete, oldest first."""
+    runs_file = Path(root) / "manifest" / "vast_runs.jsonl"
+    run_ids = []
+    with open(runs_file, encoding="utf-8") as handle:
+        for line in handle:
+            row = json.loads(line)
+            if row["market_type"] == market_type and row["status"] == "complete":
+                run_ids.append(row["run_id"])
+    return sorted(set(run_ids))
+
+
 def load_offers(root, market_type, run_id):
     """Read every raw page of one run and return its offers, each offer once."""
     pattern = f"raw/vast/type={market_type}/dt=*/run={run_id}/page_*.json.gz"

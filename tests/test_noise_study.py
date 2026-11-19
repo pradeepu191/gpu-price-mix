@@ -91,5 +91,23 @@ class SimulationTests(unittest.TestCase):
         self.assertAlmostEqual(result["bias"], 0.0)
 
 
+class HostTests(unittest.TestCase):
+    def test_price_points_group_same_host_same_price(self):
+        offers = [
+            {"host_id": 1, "dph_base": 1.72, "num_gpus": 1},
+            {"host_id": 1, "dph_base": 6.88, "num_gpus": 4},
+            {"host_id": 1, "dph_base": 2.50, "num_gpus": 1},
+            {"host_id": 2, "dph_base": 1.72, "num_gpus": 1},
+        ]
+        self.assertEqual(noise_study.price_points(offers), 3)
+        self.assertAlmostEqual(noise_study.largest_host_share(offers), 6 / 7)
+
+    def test_price_shape_floor_share(self):
+        rentals = [(1.72, 3), (1.72, 1), (2.5, 4)]
+        shape = noise_study.price_shape(rentals)
+        self.assertAlmostEqual(shape["floor_share"], 0.5)
+        self.assertEqual(shape["p10"], 1.72)
+
+
 if __name__ == "__main__":
     unittest.main()
