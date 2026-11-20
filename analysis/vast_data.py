@@ -50,6 +50,8 @@ def load_offers(root, market_type, run_id):
     for page_file in page_files:
         with gzip.open(page_file, "rb") as handle:
             page = json.loads(handle.read())
+        if not isinstance(page, list):
+            continue   # an error reply saved as evidence, not offers
         for offer in page:
             offers_by_id[offer["id"]] = offer
     return list(offers_by_id.values())
