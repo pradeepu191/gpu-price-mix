@@ -8,27 +8,26 @@ Plain-language version
   luck-driven jumps are, depending on how many rentals sit behind the hour.
 
 Method
-  1. Take one snapshot of every offer for one GPU model on Vast. Treat it as the
-     whole market at a single moment, so by construction no price changes.
-  2. Pretend N rentals happened in an hour: pick N offers at random (repeats
-     allowed, every offer equally likely).
+  1. Take one snapshot of every listed card of one GPU model on Vast. Treat it
+     as the whole market at a single moment, so by construction no price changes.
+     Each physical card is counted once, even though Vast lists most machines
+     several times as overlapping bundles.
+  2. Pretend N rentals happened in an hour: pick N at random (repeats allowed).
   3. Compute the index on those N rentals the way Ornn describes OCPI: an average
      weighted by GPU count, with the most extreme prices pulled in to a cutoff
      (a "winsorized" mean). Ornn does not publish its cutoff, so several are tried.
   4. Compare with the same index computed on the whole snapshot.
   5. Repeat thousands of times. The spread of the differences is pure chance.
 
+What a rental is
+  gpu level:     each rental is a single card. Optimistic: many small, independent picks.
+  machine level: each rental is a whole machine, weighted by its cards. Cautious:
+                 fewer, bigger picks. Real rentals sit between the two.
+
 What this does and does not show
   It measures a property of the averaging method on a realistic spread of prices.
-  It is NOT an estimate of OCPI's own error: Vast's asking prices are not the
+  It is NOT an estimate of OCPI's own error: Vast's listed prices are not the
   rentals Ornn sees, and Ornn's rental counts per hour are not public.
-
-Clustered rentals
-  The simulation treats every rental as an independent pick. If renters often
-  take several machines from one host at once, at one price, the picks are not
-  independent: 20 rentals in clusters of 4 behave like 5 independent picks, so
-  read the curve at 5. The script reports how clustered the sellers are
-  ("price points": distinct host and price pairs) to judge how much this matters.
 
 Usage (on the droplet, reads only archived files, uses no Vast quota)
   One snapshot, full tables and chart:
@@ -50,8 +49,13 @@ import vast_data  # noqa: E402
 
 RENTAL_COUNTS = [1, 2, 3, 5, 8, 13, 20, 30, 50, 80, 130, 200]
 CUTOFFS = [0.0, 0.05, 0.10]     # share of GPU weight pulled in from each tail
-QUANTILE_METHODS = ["step", "smooth"]
-CHART_CUTOFF = 0.0              # the chart shows the plain GPU-weighted average
+CHART_CUTOFF = 0.0              # the chart shows the plain average
+
+# Two ways a "rental" can be modeled. The truth sits between them.
+LEVELS = {
+    "gpu": "each rental is one GPU card, picked at random",
+    "machine": "each rental is a whole machine, picked at random, weighted by its GPU count",
+}
 
 
 def weighted_quantile(rentals, share, method="step"):
@@ -181,19 +185,8 @@ def describe_tails(rentals, cutoff, method):
     for price, weight in below:
         below_weight += weight
     print(f"  {method:6} cutoff {cutoff:.2f}: pull-in range ${low:.2f} to ${high:.2f}")
-    print(f"     at or below ${low:.2f}: {len(below)} offers, {100 * below_weight / total_weight:.1f}% of GPUs {below[:6]}")
-    print(f"     at or above ${high:.2f}: {len(above)} offers, {100 * above_weight / total_weight:.1f}% of GPUs {above[-8:]}")
-
-
-def describe(name, rentals):
-    prices = []
-    gpu_total = 0
-    for price, weight in rentals:
-        prices.append(price)
-        gpu_total += weight
-    prices.sort()
-    print(f"{name}: {len(rentals)} offers, {gpu_total} GPUs, "
-          f"price $/GPU-hr min {prices[0]:.2f}, median {statistics.median(prices):.2f}, max {prices[-1]:.2f}")
+    print(f"     at or below ${low:.2f}: {len(below)} units, {100 * below_weight / total_weight:.1f}% of GPUs {below[:6]}")
+    print(f"     at or above ${high:.2f}: {len(above)} units, {100 * above_weight / total_weight:.1f}% of GPUs {above[-8:]}")
 
 
 def signed_percent(value, _position):
@@ -214,29 +207,34 @@ def draw_chart(rows, model, population_label, out_path):
         print("matplotlib not installed, skipping the chart (pip install matplotlib)")
         return
 
-    chart_rows = []
-    for row in rows:
-        if row["cutoff"] == CHART_CUTOFF and row["method"] == "step":
-            chart_rows.append(row)
-    counts = []
-    lows = []
-    highs = []
-    for row in chart_rows:
-        counts.append(row["rentals_per_hour"])
-        lows.append(100 * row["p05"])
-        highs.append(100 * row["p95"])
+    bands = {}
+    for level in LEVELS:
+        counts = []
+        lows = []
+        highs = []
+        for row in rows:
+            if row["cutoff"] == CHART_CUTOFF and row["level"] == level:
+                counts.append(row["rentals_per_hour"])
+                lows.append(100 * row["p05"])
+                highs.append(100 * row["p95"])
+        bands[level] = (counts, lows, highs)
 
     surface = "#fcfcfb"
     ink = "#0b0b0b"
     ink_secondary = "#52514e"
-    series = "#2a78d6"
+    colors = {"gpu": "#2a78d6", "machine": "#eb6834"}
+    names = {"gpu": "Each rental is one card", "machine": "Each rental is a whole machine"}
 
     fig, ax = plt.subplots(figsize=(8, 4.5), dpi=150)
     fig.patch.set_facecolor(surface)
     ax.set_facecolor(surface)
-    ax.fill_between(counts, lows, highs, color=series, alpha=0.18, linewidth=0)
-    ax.plot(counts, highs, color=series, linewidth=2)
-    ax.plot(counts, lows, color=series, linewidth=2)
+    for level in ("machine", "gpu"):
+        counts, lows, highs = bands[level]
+        if level == "gpu":
+            ax.fill_between(counts, lows, highs, color=colors[level], alpha=0.14, linewidth=0)
+        ax.plot(counts, highs, color=colors[level], linewidth=2, label=names[level])
+        ax.plot(counts, lows, color=colors[level], linewidth=2)
+    ax.legend(frameon=False, fontsize=8.5, labelcolor=ink_secondary, loc="upper right")
     ax.axhline(0, color=ink_secondary, linewidth=0.8)
 
     ax.set_xscale("log")
@@ -251,7 +249,7 @@ def draw_chart(rows, model, population_label, out_path):
     if CHART_CUTOFF > 0:
         cutoff_note = f"The most extreme {int(CHART_CUTOFF * 100)}% of prices on each side are pulled in."
     else:
-        cutoff_note = "Plain average weighted by GPU count."
+        cutoff_note = "Plain average, each card counted once."
     fig.text(0.012, 0.905, f"90% of chance outcomes fall inside the band. {population_label}. {cutoff_note}",
              color=ink_secondary, fontsize=8.5, va="top")
 
@@ -267,101 +265,80 @@ def draw_chart(rows, model, population_label, out_path):
     print(f"chart: {out_path}")
 
 
-def select_offers(offers, model, occupied_only):
-    """Usable offers for one GPU model. Returns (selected, occupied_count)."""
-    selected = []
-    occupied_count = 0
-    for offer in offers:
-        if offer["gpu_name"] != model:
-            continue
-        if offer["num_gpus"] <= 0 or offer["dph_base"] is None:
-            continue
-        occupied = vast_data.is_occupied(offer)
-        if occupied:
-            occupied_count += 1
-        if occupied_only and not occupied:
-            continue
-        selected.append(offer)
-    return selected, occupied_count
+def units(cards, level):
+    """Turn cards into (price, weight) pairs for one way of modeling a rental."""
+    result = []
+    if level == "gpu":
+        for card in cards:
+            result.append((card["price"], 1))
+    else:
+        for machine in vast_data.machines(cards):
+            result.append((machine["price"], machine["gpus"]))
+    return result
 
 
-def offer_rentals(offers):
-    """One (price per GPU-hour, GPU count) per offer."""
-    rentals = []
-    for offer in offers:
-        rentals.append((vast_data.price_per_gpu_hour(offer), offer["num_gpus"]))
-    return rentals
+def select_cards(offers, model, occupied_only):
+    cards = vast_data.physical_gpus(offers, model)
+    if occupied_only:
+        kept = []
+        for card in cards:
+            if card["occupied"]:
+                kept.append(card)
+        cards = kept
+    return cards
 
 
-def price_points(offers):
-    """Distinct (host, price) pairs. Offers sharing one are likely priced, and maybe rented, together."""
-    points = set()
-    for offer in offers:
-        points.add((offer["host_id"], round(vast_data.price_per_gpu_hour(offer), 4)))
-    return len(points)
-
-
-def largest_host_share(offers):
-    """Share of all GPUs listed by the single biggest host."""
-    gpus_by_host = {}
-    total = 0
-    for offer in offers:
-        gpus_by_host[offer["host_id"]] = gpus_by_host.get(offer["host_id"], 0) + offer["num_gpus"]
-        total += offer["num_gpus"]
-    return max(gpus_by_host.values()) / total
-
-
-def gpu_count_of_host(item):
-    """Sort key: a (host, info) pair ranked by how many GPUs that host lists."""
-    return item[1]["gpus"]
-
-
-def describe_hosts(offers):
-    """Who sells: how concentrated the listings are, and whether hosts price all machines alike."""
-    by_host = {}
-    total_gpus = 0
-    for offer in offers:
-        host = offer["host_id"]
-        if host not in by_host:
-            by_host[host] = {"offers": 0, "gpus": 0, "prices": set()}
-        by_host[host]["offers"] += 1
-        by_host[host]["gpus"] += offer["num_gpus"]
-        by_host[host]["prices"].add(round(vast_data.price_per_gpu_hour(offer), 2))
-        total_gpus += offer["num_gpus"]
-
-    ranked = sorted(by_host.items(), key=gpu_count_of_host, reverse=True)
-    points = price_points(offers)
-    print(f"\nwho sells: {len(by_host)} hosts, {points} distinct host-and-price points, {len(offers)} offers")
-    print(f"  average offers per price point: {len(offers) / points:.1f} "
-          f"(if renters take a whole point at once, divide rentals per hour by this)")
-    print("  host        offers  GPUs  share  distinct prices")
-    for host, info in ranked[:8]:
-        prices = sorted(info["prices"])
-        shown = ", ".join(f"${price:.2f}" for price in prices[:5])
-        print(f"  {host:<10}  {info['offers']:6d}  {info['gpus']:4d}  {100 * info['gpus'] / total_gpus:4.0f}%  {shown}")
-
-
-def price_shape(rentals):
-    """Simple description of the price spread, weighted by GPUs."""
-    lowest = min(price for price, weight in rentals)
+def price_shape(prices_and_weights):
+    """Simple description of the price spread, weighted."""
+    lowest = min(price for price, weight in prices_and_weights)
     total = 0
     near_floor = 0
-    for price, weight in rentals:
+    for price, weight in prices_and_weights:
         total += weight
         if price <= lowest * 1.01:
             near_floor += weight
     return {
-        "p10": weighted_quantile(rentals, 0.10),
-        "p50": weighted_quantile(rentals, 0.50),
-        "p90": weighted_quantile(rentals, 0.90),
+        "p10": weighted_quantile(prices_and_weights, 0.10),
+        "p50": weighted_quantile(prices_and_weights, 0.50),
+        "p90": weighted_quantile(prices_and_weights, 0.90),
         "floor_share": near_floor / total,
     }
 
 
+def host_shares(cards):
+    """Each host's share of all cards, largest first."""
+    counts = {}
+    for card in cards:
+        counts[card["host_id"]] = counts.get(card["host_id"], 0) + 1
+    shares = []
+    for host, count in counts.items():
+        shares.append((count / len(cards), host))
+    shares.sort(reverse=True)
+    return shares
+
+
+def describe_market(cards):
+    machine_list = vast_data.machines(cards)
+    occupied = 0
+    for card in cards:
+        if card["occupied"]:
+            occupied += 1
+    shape = price_shape(units(cards, "gpu"))
+    shares = host_shares(cards)
+    print(f"cards: {len(cards)}   machines: {len(machine_list)}   hosts: {len(shares)}   "
+          f"occupied: {100 * occupied / len(cards):.0f}%")
+    print(f"price per GPU-hour: 10th pct ${shape['p10']:.2f}, median ${shape['p50']:.2f}, "
+          f"90th pct ${shape['p90']:.2f}, lowest ${min(card['price'] for card in cards):.2f}")
+    print(f"cards within 1% of the lowest price: {100 * shape['floor_share']:.0f}%")
+    top = shares[:5]
+    print("largest hosts' share of cards: " + ", ".join(f"{100 * share:.0f}%" for share, host in top)
+          + f"   (top two together: {100 * (shares[0][0] + (shares[1][0] if len(shares) > 1 else 0)):.0f}%)")
+
+
 def print_rows(rows):
-    print("\nmethod cutoff  rentals    bias   5th pct   median  95th pct   typical |error|")
+    print("\nlevel    cutoff  rentals    bias   5th pct   median  95th pct   typical |error|")
     for row in rows:
-        print(f"{row['method']:6} {row['cutoff']:6.2f}  {row['rentals_per_hour']:7d}  {100 * row['bias']:+5.1f}%  "
+        print(f"{row['level']:8} {row['cutoff']:6.2f}  {row['rentals_per_hour']:7d}  {100 * row['bias']:+5.1f}%  "
               f"{100 * row['p05']:+7.1f}%  {100 * row['p50']:+6.1f}%  {100 * row['p95']:+7.1f}%  "
               f"{100 * row['typical_abs']:10.1f}%")
 
@@ -373,37 +350,38 @@ def write_csv(rows, path):
         writer.writerows(rows)
 
 
-def run_single(args, run_id):
-    all_offers = vast_data.load_offers(args.root, args.market, run_id)
-    offers, occupied_count = select_offers(all_offers, args.model, args.occupied_only)
-    if len(offers) < 10:
-        sys.exit(f"Only {len(offers)} usable {args.model} offers in run {run_id}; too few to study.")
-    rentals = offer_rentals(offers)
-
-    population_label = "Occupied machines only" if args.occupied_only else "All listed offers"
-    print(f"run {run_id}, {args.market}, {args.model}, {population_label.lower()}")
-    print(f"occupied (rentable=False): {occupied_count}")
-    describe("population", rentals)
-    describe_hosts(offers)
-
-    print("\nwhere the cutoffs land:")
-    for method in QUANTILE_METHODS:
-        for cutoff in CUTOFFS:
-            if cutoff > 0:
-                describe_tails(rentals, cutoff, method)
-
+def study(cards, repeats, seed):
+    """All simulation rows for one snapshot."""
     rows = []
-    for method in QUANTILE_METHODS:
+    for level in LEVELS:
+        pairs = units(cards, level)
         for cutoff in CUTOFFS:
-            if cutoff == 0 and method != "step":
-                continue   # with no cutoff the method makes no difference
             for count in RENTAL_COUNTS:
-                # same random draws for every setting, so differences come from the method
-                rng = random.Random(args.seed + count)
-                result = simulate(rentals, count, cutoff, args.repeats, rng, method)
-                row = {"method": method, "cutoff": cutoff, "rentals_per_hour": count}
+                rng = random.Random(seed + count)
+                result = simulate(pairs, count, cutoff, repeats, rng)
+                row = {"level": level, "cutoff": cutoff, "rentals_per_hour": count}
                 row.update(result)
                 rows.append(row)
+    return rows
+
+
+def run_single(args, run_id):
+    offers = vast_data.load_offers(args.root, args.market, run_id)
+    cards = select_cards(offers, args.model, args.occupied_only)
+    if len(cards) < 10:
+        sys.exit(f"Only {len(cards)} usable {args.model} cards in run {run_id}; too few to study.")
+
+    population_label = "Occupied cards only" if args.occupied_only else "All listed cards"
+    print(f"run {run_id}, {args.market}, {args.model}, {population_label.lower()}")
+    describe_market(cards)
+
+    print("\nwhere the cutoffs land (machine level, where big machines make the tails lumpy):")
+    machine_pairs = units(cards, "machine")
+    for cutoff in CUTOFFS:
+        if cutoff > 0:
+            describe_tails(machine_pairs, cutoff, "step")
+
+    rows = study(cards, args.repeats, args.seed)
     print_rows(rows)
 
     args.out.mkdir(parents=True, exist_ok=True)
@@ -414,74 +392,79 @@ def run_single(args, run_id):
     draw_chart(rows, args.model, population_label, args.out / f"noise_{tag}.png")
 
 
+def headline(cards, repeats, seed):
+    """A few numbers per snapshot, to check stability over time."""
+    gpu_pairs = units(cards, "gpu")
+    machine_pairs = units(cards, "machine")
+    shape = price_shape(gpu_pairs)
+    shares = host_shares(cards)
+    occupied = 0
+    for card in cards:
+        if card["occupied"]:
+            occupied += 1
+    gpu_20 = simulate(gpu_pairs, 20, 0.0, repeats, random.Random(seed))
+    machine_20 = simulate(machine_pairs, 20, 0.0, repeats, random.Random(seed))
+    gpu_3 = simulate(gpu_pairs, 3, 0.0, repeats, random.Random(seed))
+    machine_cut10 = simulate(machine_pairs, 20, 0.10, repeats, random.Random(seed))
+    return {
+        "cards": len(cards),
+        "machines": len(machine_pairs),
+        "hosts": len(shares),
+        "top2_host_share": shares[0][0] + (shares[1][0] if len(shares) > 1 else 0),
+        "occupied_share": occupied / len(cards),
+        "price_p50": shape["p50"],
+        "floor_share": shape["floor_share"],
+        "gpu20_low": gpu_20["p05"],
+        "gpu20_high": gpu_20["p95"],
+        "machine20_low": machine_20["p05"],
+        "machine20_high": machine_20["p95"],
+        "gpu3_median_error": gpu_3["p50"],
+        "machine20_cut10_bias": machine_cut10["bias"],
+    }
+
+
 def run_all(args):
-    """A few headline numbers for every complete snapshot, to see whether they hold up."""
-    run_ids = vast_data.complete_runs(args.root, args.market)
     rows = []
-    for run_id in run_ids:
-        all_offers = vast_data.load_offers(args.root, args.market, run_id)
-        offers, occupied_count = select_offers(all_offers, args.model, args.occupied_only)
-        if len(offers) < 10:
-            print(f"{run_id}: only {len(offers)} offers, skipped")
+    for run_id in vast_data.complete_runs(args.root, args.market):
+        offers = vast_data.load_offers(args.root, args.market, run_id)
+        cards = select_cards(offers, args.model, args.occupied_only)
+        if len(cards) < 10:
+            print(f"{run_id}: only {len(cards)} cards, skipped")
             continue
-        rentals = offer_rentals(offers)
-        shape = price_shape(rentals)
-        gpu_total = 0
-        for price, weight in rentals:
-            gpu_total += weight
-
-        plain_20 = simulate(rentals, 20, 0.0, args.repeats, random.Random(args.seed), "step")
-        plain_3 = simulate(rentals, 3, 0.0, args.repeats, random.Random(args.seed), "step")
-        cut10_20 = simulate(rentals, 20, 0.10, args.repeats, random.Random(args.seed), "step")
-
-        rows.append({
-            "run_id": run_id,
-            "offers": len(offers),
-            "gpus": gpu_total,
-            "hosts": len(set(offer["host_id"] for offer in offers)),
-            "price_points": price_points(offers),
-            "largest_host_share": largest_host_share(offers),
-            "occupied_share": occupied_count / len(offers),
-            "price_p10": shape["p10"],
-            "price_p50": shape["p50"],
-            "price_p90": shape["p90"],
-            "floor_share": shape["floor_share"],
-            "band20_low": plain_20["p05"],
-            "band20_high": plain_20["p95"],
-            "median_error_3": plain_3["p50"],
-            "cut10_bias_20": cut10_20["bias"],
-        })
-
+        row = {"run_id": run_id}
+        row.update(headline(cards, args.repeats, args.seed))
+        rows.append(row)
     if not rows:
         sys.exit("No usable snapshots yet.")
-
-    print(f"{len(rows)} snapshots of {args.model}, {args.market}\n")
-    print("run_id            offers hosts points top-host occ%  p50 price floor%   band @20 rentals   "
-          "median@3  lean@cut10")
-    for row in rows:
-        print(f"{row['run_id']}  {row['offers']:5d} {row['hosts']:5d} {row['price_points']:6d}"
-              f"    {100 * row['largest_host_share']:4.0f}% {100 * row['occupied_share']:4.0f}%"
-              f"   ${row['price_p50']:5.2f}  {100 * row['floor_share']:4.0f}%"
-              f"   {100 * row['band20_low']:+5.1f}% {100 * row['band20_high']:+5.1f}%"
-              f"     {100 * row['median_error_3']:+5.1f}%    {100 * row['cut10_bias_20']:+5.1f}%")
-
-    print("\nacross snapshots (min / median / max):")
-    for key in ("band20_low", "band20_high", "median_error_3", "cut10_bias_20",
-                "floor_share", "largest_host_share"):
-        values = []
-        for row in rows:
-            values.append(row[key])
-        values.sort()
-        print(f"  {key:18} {100 * values[0]:+6.1f}%  {100 * statistics.median(values):+6.1f}%  {100 * values[-1]:+6.1f}%")
-
+    print_summary(rows, args.model, args.market)
     args.out.mkdir(parents=True, exist_ok=True)
     csv_path = args.out / f"noise_by_snapshot_{args.model.replace(' ', '_')}.csv"
     write_csv(rows, csv_path)
     print(f"\ntable: {csv_path}")
 
 
+def print_summary(rows, model, market):
+    print(f"{len(rows)} snapshots of {model}, {market}\n")
+    print("run_id            cards mach hosts top2  occ%  median  20 rentals: per card   per machine   "
+          "median@3  lean@cut10")
+    for row in rows:
+        print(f"{row['run_id']}  {row['cards']:5d} {row['machines']:4d} {row['hosts']:5d} "
+              f"{100 * row['top2_host_share']:4.0f}% {100 * row['occupied_share']:4.0f}%  ${row['price_p50']:5.2f}"
+              f"     {100 * row['gpu20_low']:+5.1f}% {100 * row['gpu20_high']:+5.1f}%"
+              f"   {100 * row['machine20_low']:+5.1f}% {100 * row['machine20_high']:+5.1f}%"
+              f"   {100 * row['gpu3_median_error']:+5.1f}%    {100 * row['machine20_cut10_bias']:+5.1f}%")
+    print("\nacross snapshots (min / median / max):")
+    for key in ("gpu20_low", "gpu20_high", "machine20_low", "machine20_high", "gpu3_median_error",
+                "machine20_cut10_bias", "top2_host_share", "occupied_share", "floor_share"):
+        values = []
+        for row in rows:
+            values.append(row[key])
+        values.sort()
+        print(f"  {key:22} {100 * values[0]:+6.1f}%  {100 * statistics.median(values):+6.1f}%  {100 * values[-1]:+6.1f}%")
+
+
 def main():
-    parser = argparse.ArgumentParser(description=__doc__.split("\n")[1])
+    parser = argparse.ArgumentParser(description="Chance error of an hourly GPU price index")
     parser.add_argument("--root", type=Path, default=Path("/root/data"))
     parser.add_argument("--model", default="H100 SXM")
     parser.add_argument("--market", default="on-demand")
@@ -491,7 +474,7 @@ def main():
                         help="random repeats per setting (default 20000, or 4000 with --all-runs)")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--occupied-only", action="store_true",
-                        help="use only machines currently rented, the closest thing to real rentals")
+                        help="use only cards currently in no rentable offer, the closest thing to real rentals")
     parser.add_argument("--out", type=Path, default=Path("/root/data/analysis"))
     args = parser.parse_args()
 
@@ -500,7 +483,6 @@ def main():
             args.repeats = 4000
         run_all(args)
         return
-
     if args.repeats is None:
         args.repeats = 20000
     run_id = args.run_id or vast_data.latest_complete_run(args.root, args.market)

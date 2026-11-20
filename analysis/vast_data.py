@@ -64,7 +64,63 @@ def price_per_gpu_hour(offer):
     return offer["dph_base"] / offer["num_gpus"]
 
 
-def is_occupied(offer):
-    """Working assumption, still to be confirmed over time: an offer Vast lists
-    as not rentable is a machine someone is currently renting."""
-    return offer["rentable"] is False
+def physical_gpus(offers, model=None):
+    """One record per physical GPU card.
+
+    Vast lists the same machine several times at once, as overlapping bundles
+    (for example 1, 2, 4 and 8 GPUs of one 8-GPU machine), so counting offers
+    counts the same cards repeatedly. gpu_ids names the actual cards, so each
+    card is kept once.
+
+    A card is free if any offer containing it can be rented right now. An
+    offer shows as not rentable as soon as any one of its cards is taken, so
+    "not rentable" on a big bundle does not mean all its cards are rented.
+    Occupied here means: in no rentable offer. Our working assumption is that
+    this means rented, which repeated snapshots let us check.
+    """
+    by_gpu = {}
+    for offer in offers:
+        if model is not None and offer["gpu_name"] != model:
+            continue
+        if not offer.get("num_gpus") or offer.get("dph_base") is None:
+            continue
+        price = price_per_gpu_hour(offer)
+        for gpu_id in offer.get("gpu_ids") or []:
+            record = by_gpu.get(gpu_id)
+            if record is None:
+                record = {
+                    "gpu_id": gpu_id,
+                    "gpu_name": offer["gpu_name"],
+                    "machine_id": offer["machine_id"],
+                    "host_id": offer["host_id"],
+                    "price": price,
+                    "free": False,
+                }
+                by_gpu[gpu_id] = record
+            # Bundles of one machine nearly always share a per-GPU price. Keep the lowest if not.
+            if price < record["price"]:
+                record["price"] = price
+            if offer["rentable"] is True:
+                record["free"] = True
+
+    cards = list(by_gpu.values())
+    for card in cards:
+        card["occupied"] = not card["free"]
+    return cards
+
+
+def machines(cards):
+    """One record per machine: how many of the given cards it has, and their typical price."""
+    by_machine = {}
+    for card in cards:
+        machine = by_machine.setdefault(card["machine_id"], {
+            "machine_id": card["machine_id"], "host_id": card["host_id"], "prices": [], "gpus": 0})
+        machine["prices"].append(card["price"])
+        machine["gpus"] += 1
+    result = []
+    for machine in by_machine.values():
+        prices = sorted(machine["prices"])
+        machine["price"] = prices[len(prices) // 2]
+        del machine["prices"]
+        result.append(machine)
+    return result

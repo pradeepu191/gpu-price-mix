@@ -91,20 +91,47 @@ class SimulationTests(unittest.TestCase):
         self.assertAlmostEqual(result["bias"], 0.0)
 
 
-class HostTests(unittest.TestCase):
-    def test_price_points_group_same_host_same_price(self):
-        offers = [
-            {"host_id": 1, "dph_base": 1.72, "num_gpus": 1},
-            {"host_id": 1, "dph_base": 6.88, "num_gpus": 4},
-            {"host_id": 1, "dph_base": 2.50, "num_gpus": 1},
-            {"host_id": 2, "dph_base": 1.72, "num_gpus": 1},
+class CardTests(unittest.TestCase):
+    def nested_offers(self):
+        # One 4-GPU machine listed as a 4-GPU bundle (not rentable, one card taken)
+        # and as a 1-GPU bundle of a spare card (rentable), plus a second machine.
+        return [
+            {"id": 1, "gpu_name": "H100 SXM", "machine_id": 10, "host_id": 7, "num_gpus": 4,
+             "dph_base": 8.0, "rentable": False, "gpu_ids": [1, 2, 3, 4]},
+            {"id": 2, "gpu_name": "H100 SXM", "machine_id": 10, "host_id": 7, "num_gpus": 1,
+             "dph_base": 2.0, "rentable": True, "gpu_ids": [4]},
+            {"id": 3, "gpu_name": "H100 SXM", "machine_id": 11, "host_id": 8, "num_gpus": 2,
+             "dph_base": 6.0, "rentable": False, "gpu_ids": [5, 6]},
+            {"id": 4, "gpu_name": "B200", "machine_id": 12, "host_id": 8, "num_gpus": 1,
+             "dph_base": 9.0, "rentable": True, "gpu_ids": [7]},
         ]
-        self.assertEqual(noise_study.price_points(offers), 3)
-        self.assertAlmostEqual(noise_study.largest_host_share(offers), 6 / 7)
+
+    def test_each_card_counted_once(self):
+        cards = noise_study.vast_data.physical_gpus(self.nested_offers(), "H100 SXM")
+        self.assertEqual(len(cards), 6)
+
+    def test_card_is_free_if_any_offer_with_it_is_rentable(self):
+        cards = noise_study.vast_data.physical_gpus(self.nested_offers(), "H100 SXM")
+        occupied = {}
+        for card in cards:
+            occupied[card["gpu_id"]] = card["occupied"]
+        self.assertFalse(occupied[4])
+        self.assertTrue(occupied[1])
+        self.assertTrue(occupied[5])
+
+    def test_machine_units_weight_by_cards(self):
+        cards = noise_study.vast_data.physical_gpus(self.nested_offers(), "H100 SXM")
+        pairs = sorted(noise_study.units(cards, "machine"))
+        self.assertEqual(pairs, [(2.0, 4), (3.0, 2)])
+        self.assertEqual(len(noise_study.units(cards, "gpu")), 6)
+
+    def test_host_shares(self):
+        cards = noise_study.vast_data.physical_gpus(self.nested_offers(), "H100 SXM")
+        shares = noise_study.host_shares(cards)
+        self.assertAlmostEqual(shares[0][0], 4 / 6)
 
     def test_price_shape_floor_share(self):
-        rentals = [(1.72, 3), (1.72, 1), (2.5, 4)]
-        shape = noise_study.price_shape(rentals)
+        shape = noise_study.price_shape([(1.72, 3), (1.72, 1), (2.5, 4)])
         self.assertAlmostEqual(shape["floor_share"], 0.5)
         self.assertEqual(shape["p10"], 1.72)
 
