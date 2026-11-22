@@ -8,35 +8,38 @@ import json
 from pathlib import Path
 
 
-def latest_complete_run(root, market_type):
-    """Return the run_id of the newest run whose read of this market was complete."""
-    runs_file = Path(root) / "manifest" / "vast_runs.jsonl"
-    latest = None
-    with open(runs_file, encoding="utf-8") as handle:
-        for line in handle:
-            row = json.loads(line)
-            if row["market_type"] != market_type:
-                continue
-            if row["status"] != "complete":
-                continue
-            # run ids are UTC timestamps like 20261119T040418Z, so text order is time order
-            if latest is None or row["run_id"] > latest:
-                latest = row["run_id"]
-    if latest is None:
-        raise FileNotFoundError(f"No complete {market_type} run in {runs_file}")
-    return latest
+def is_full(row):
+    """True for runs that also asked for the machines Vast's search leaves out
+    (collector 0.4 and later), and finished doing so. Earlier runs show only
+    about three quarters of live machines, so counts from them are too low."""
+    return row.get("lookup_status") == "complete"
 
 
-def complete_runs(root, market_type):
-    """Every run_id whose read of this market was complete, oldest first."""
+def complete_runs(root, market_type, full_only=False):
+    """Every run_id whose read of this market was complete, oldest first.
+
+    full_only keeps just the runs that include the hidden-machine lookups.
+    Use it for anything that counts machines, cards, sellers or occupancy.
+    """
     runs_file = Path(root) / "manifest" / "vast_runs.jsonl"
     run_ids = []
     with open(runs_file, encoding="utf-8") as handle:
         for line in handle:
             row = json.loads(line)
-            if row["market_type"] == market_type and row["status"] == "complete":
-                run_ids.append(row["run_id"])
+            if row["market_type"] != market_type or row["status"] != "complete":
+                continue
+            if full_only and not is_full(row):
+                continue
+            run_ids.append(row["run_id"])
     return sorted(set(run_ids))
+
+
+def latest_complete_run(root, market_type, full_only=False):
+    """Return the run_id of the newest complete run of this market."""
+    run_ids = complete_runs(root, market_type, full_only)
+    if not run_ids:
+        raise FileNotFoundError(f"No complete {market_type} run found (full_only={full_only})")
+    return run_ids[-1]
 
 
 def load_offers(root, market_type, run_id):

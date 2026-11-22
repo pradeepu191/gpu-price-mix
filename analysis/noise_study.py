@@ -425,7 +425,12 @@ def headline(cards, repeats, seed):
 
 def run_all(args):
     rows = []
-    for run_id in vast_data.complete_runs(args.root, args.market):
+    run_ids = vast_data.complete_runs(args.root, args.market, full_only=not args.include_partial)
+    if not args.include_partial:
+        skipped = len(vast_data.complete_runs(args.root, args.market)) - len(run_ids)
+        print(f"using {len(run_ids)} full snapshots (hidden machines included). "
+              f"{skipped} earlier partial snapshots left out. Add --include-partial to see them too.\n")
+    for run_id in run_ids:
         offers = vast_data.load_offers(args.root, args.market, run_id)
         cards = select_cards(offers, args.model, args.occupied_only)
         if len(cards) < 10:
@@ -472,6 +477,8 @@ def main():
     parser.add_argument("--all-runs", action="store_true", help="summarize every complete snapshot")
     parser.add_argument("--repeats", type=int, default=None,
                         help="random repeats per setting (default 20000, or 4000 with --all-runs)")
+    parser.add_argument("--include-partial", action="store_true",
+                        help="also use snapshots from before the collector asked for hidden machines")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--occupied-only", action="store_true",
                         help="use only cards currently in no rentable offer, the closest thing to real rentals")
@@ -485,7 +492,7 @@ def main():
         return
     if args.repeats is None:
         args.repeats = 20000
-    run_id = args.run_id or vast_data.latest_complete_run(args.root, args.market)
+    run_id = args.run_id or vast_data.latest_complete_run(args.root, args.market, full_only=not args.include_partial)
     run_single(args, run_id)
 
 
