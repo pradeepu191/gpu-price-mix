@@ -20,6 +20,17 @@ Method
        rentable cards only  only cards someone could rent at that moment
   4. For each way, report how far the average swings across snapshots, and the
      chance band for 20 random rentals (see noise_study.py).
+  5. Control. Step 2 picks cards because their price moved, so removing them
+     must reduce movement. As a comparison, also flag cards whose price moved
+     more than 20% across readings where they WERE rentable (a price someone
+     could act on) and remove those instead.
+  6. Split every step between two snapshots into three parts that add up exactly:
+       same cards, price moved, not rentable at both readings
+       same cards, price moved, rentable at one reading or both
+       cards entering or leaving the list (the mix effect)
+     This part uses no threshold and no flagging, so it is not circular.
+     Caution: Vast's lookups sometimes return only part of a machine, so some
+     "entering or leaving" is the recorder missing cards, not cards moving.
 
 What this does and does not show
   It shows how much an average of listed prices depends on which prices are
@@ -48,7 +59,7 @@ THRESHOLD = 0.20        # a card is flagged if its asking price moved more than 
 RENTALS = 20            # rentals per hour used for the chance band
 MIN_CARDS_MODEL = 10    # models with fewer cards than this are skipped
 MIN_CARDS_BAND = 5      # a chance band needs at least this many cards
-WAYS = ["all cards", "without those cards", "rentable cards only"]
+WAYS = ["all cards", "without those cards", "rentable cards only", "control"]
 
 
 def card_key(card):
@@ -64,17 +75,18 @@ def load_cards_by_run(root, market_type):
     return cards_by_run
 
 
-def find_repricers(cards_by_run, threshold=THRESHOLD):
-    """Cards whose asking price moved more than `threshold` while not rentable.
+def find_movers(cards_by_run, threshold=THRESHOLD, while_rentable=False):
+    """Cards whose asking price moved more than `threshold` across one kind of reading.
 
-    Only readings where the card was in no rentable offer are used. A card seen
-    not rentable fewer than twice cannot be flagged.
+    while_rentable=False uses only readings where the card was in no rentable
+    offer. while_rentable=True uses only readings where it could be rented.
+    A card with fewer than two such readings cannot be flagged.
     Returns card key -> {"low", "high", "changes", "readings", "machine_id", "host_id"}.
     """
     history = {}
     for run_id in sorted(cards_by_run):
         for card in cards_by_run[run_id]:
-            if card["free"]:
+            if card["free"] != while_rentable:
                 continue
             history.setdefault(card_key(card), []).append(card)
 
@@ -104,16 +116,29 @@ def find_repricers(cards_by_run, threshold=THRESHOLD):
     return flagged
 
 
-def three_ways(cards, flagged):
-    """Split one snapshot's cards into the three sets being compared."""
+def find_repricers(cards_by_run, threshold=THRESHOLD):
+    """Cards whose asking price moved more than `threshold` while not rentable."""
+    return find_movers(cards_by_run, threshold, while_rentable=False)
+
+
+def three_ways(cards, flagged, control=None):
+    """Split one snapshot's cards into the sets being compared.
+
+    control is the comparison group: cards whose price moved while rentable.
+    """
+    control = control or {}
     without = []
     rentable = []
+    without_control = []
     for card in cards:
         if card_key(card) not in flagged:
             without.append(card)
         if card["free"]:
             rentable.append(card)
-    return {"all cards": cards, "without those cards": without, "rentable cards only": rentable}
+        if card_key(card) not in control:
+            without_control.append(card)
+    return {"all cards": cards, "without those cards": without, "rentable cards only": rentable,
+            "control": without_control}
 
 
 def average_price(cards):
@@ -128,8 +153,8 @@ def swing(values):
     return max(values) / min(values) - 1
 
 
-def snapshot_rows(model, cards_by_run, flagged, repeats, seed):
-    """One row per snapshot: card counts, averages and chance bands, three ways."""
+def snapshot_rows(model, cards_by_run, flagged, repeats, seed, control=None):
+    """One row per snapshot: card counts, averages and chance bands, each way."""
     rows = []
     for run_id in sorted(cards_by_run):
         cards = []
@@ -139,7 +164,7 @@ def snapshot_rows(model, cards_by_run, flagged, repeats, seed):
         if not cards:
             continue
         row = {"model": model, "run_id": run_id}
-        for way, subset in three_ways(cards, flagged).items():
+        for way, subset in three_ways(cards, flagged, control).items():
             row[f"cards: {way}"] = len(subset)
             row[f"average: {way}"] = average_price(subset) if subset else None
             if len(subset) >= MIN_CARDS_BAND:
@@ -162,8 +187,12 @@ def column(rows, name):
     return values
 
 
-def summarize(model, rows, flagged):
+def summarize(model, rows, flagged, control=None):
     """Roll one model's snapshot rows up into a few numbers per way."""
+    control_cards = 0
+    for key in control or {}:
+        if key[0] == model:
+            control_cards += 1
     model_flagged = {}
     for key, info in flagged.items():
         if key[0] == model:
@@ -185,6 +214,7 @@ def summarize(model, rows, flagged):
         "flagged machines": len(machines),
         "flagged sellers": len(sellers),
         "largest seller share of flagged": max(sellers.values()) / len(model_flagged) if model_flagged else 0.0,
+        "control cards ever": control_cards,
     }
     for way in WAYS:
         averages = column(rows, f"average: {way}")
@@ -230,10 +260,120 @@ def print_summary(summary, threshold):
               f"{percent(summary[f'average swing: {way}'])}   "
               f"{percent(summary[f'band low median: {way}'], True)} {percent(summary[f'band high median: {way}'], True)}"
               f"          {percent(summary[f'band low widest: {way}'], True)} {percent(summary[f'band high widest: {way}'], True)}")
+    print(f"  (control = without the {summary['control cards ever']} cards whose asking price moved more than "
+          f"{100 * threshold:.0f}% while rentable)")
     thin = summary["snapshots with a band: rentable cards only"]
     if thin < summary["snapshots"]:
         print(f"  (rentable cards only: {summary['snapshots'] - thin} of {summary['snapshots']} snapshots had fewer than "
               f"{MIN_CARDS_BAND} rentable cards, so no band for those)")
+
+
+def seller_overlap(flagged):
+    """How concentrated the flagged cards are across sellers and GPU models. No ids returned."""
+    cards_by_seller = {}
+    models_by_seller = {}
+    for key, info in flagged.items():
+        seller = info["host_id"]
+        cards_by_seller[seller] = cards_by_seller.get(seller, 0) + 1
+        models_by_seller.setdefault(seller, set()).add(key[0])
+    in_several = 0
+    for models in models_by_seller.values():
+        if len(models) >= 2:
+            in_several += 1
+    shares = sorted(cards_by_seller.values(), reverse=True)
+    total = len(flagged)
+    return {
+        "flagged cards": total,
+        "sellers": len(cards_by_seller),
+        "sellers in two or more models": in_several,
+        "largest seller share": shares[0] / total if total else 0.0,
+        "top three sellers share": sum(shares[:3]) / total if total else 0.0,
+    }
+
+
+def decompose_steps(model, cards_by_run):
+    """Split each step between consecutive snapshots into three parts that add up exactly.
+
+    change in the average
+      = price moves on cards present in both snapshots and not rentable in both
+      + price moves on cards present in both and rentable in at least one
+      + everything else, which is cards entering or leaving the list (mix)
+    """
+    steps = []
+    previous_id = None
+    previous = None
+    for run_id in sorted(cards_by_run):
+        current = {}
+        for card in cards_by_run[run_id]:
+            if card["gpu_name"] == model:
+                current[card["gpu_id"]] = card
+        if not current:
+            continue
+        if previous is not None:
+            staying = []
+            for gpu_id in current:
+                if gpu_id in previous:
+                    staying.append(gpu_id)
+            average_before = average_price(list(previous.values()))
+            average_now = average_price(list(current.values()))
+            not_rentable_part = 0.0
+            rentable_part = 0.0
+            for gpu_id in staying:
+                move = current[gpu_id]["price"] - previous[gpu_id]["price"]
+                if not current[gpu_id]["free"] and not previous[gpu_id]["free"]:
+                    not_rentable_part += move
+                else:
+                    rentable_part += move
+            if staying:
+                not_rentable_part /= len(staying)
+                rentable_part /= len(staying)
+            change = average_now - average_before
+            steps.append({
+                "model": model,
+                "from_run": previous_id,
+                "to_run": run_id,
+                "average before": average_before,
+                "average now": average_now,
+                "change": change,
+                "price moved, not rentable": not_rentable_part,
+                "price moved, rentable": rentable_part,
+                "entering or leaving": change - not_rentable_part - rentable_part,
+                "cards staying": len(staying),
+                "cards entered": len(current) - len(staying),
+                "cards left": len(previous) - len(staying),
+            })
+        previous_id = run_id
+        previous = current
+    return steps
+
+
+STEP_PARTS = ["change", "price moved, not rentable", "price moved, rentable", "entering or leaving"]
+
+
+def summarize_steps(steps):
+    """Typical size of each part of a step, as a share of the average price level."""
+    level = statistics.fmean(step["average before"] for step in steps)
+    summary = {"model": steps[0]["model"], "steps": len(steps)}
+    for part in STEP_PARTS:
+        summary[part] = statistics.fmean(abs(step[part]) for step in steps) / level
+    summary["cards entered or left per step"] = statistics.fmean(
+        step["cards entered"] + step["cards left"] for step in steps)
+    return summary
+
+
+def print_steps(step_summary):
+    print(f"  what moved the average between one snapshot and the next (typical size, as a share of the average price):")
+    labels = {
+        "change": "whole step",
+        "price moved, not rentable": "same cards, price moved, not rentable",
+        "price moved, rentable": "same cards, price moved, rentable",
+        "entering or leaving": "cards entering or leaving the list",
+    }
+    for part in STEP_PARTS:
+        print(f"    {labels[part]:40} {100 * step_summary[part]:5.2f}%")
+    print(f"    cards entering or leaving per step: about {step_summary['cards entered or left per step']:.0f}")
+    print("    (the three parts add up to the whole step exactly, sign included. Their sizes can add up to more"
+          " when they pull in opposite directions.)")
 
 
 def print_machines(model, flagged):
@@ -281,6 +421,7 @@ def main():
     print(f"{len(run_ids)} full snapshots, {run_ids[0]} to {run_ids[-1]}, {args.market}")
 
     flagged = find_repricers(cards_by_run, args.threshold)
+    control = find_movers(cards_by_run, args.threshold, while_rentable=True)
     models = set()
     for cards in cards_by_run.values():
         for card in cards:
@@ -289,14 +430,19 @@ def main():
         models = {args.model}
 
     all_rows = []
+    all_steps = []
     summaries = []
     for model in sorted(models):
-        rows = snapshot_rows(model, cards_by_run, flagged, args.repeats, args.seed)
+        rows = snapshot_rows(model, cards_by_run, flagged, args.repeats, args.seed, control)
         if not rows or statistics.median(column(rows, "cards: all cards")) < MIN_CARDS_MODEL:
             print(f"\n{model}   fewer than {MIN_CARDS_MODEL} cards, skipped")
             continue
-        summary = summarize(model, rows, flagged)
+        summary = summarize(model, rows, flagged, control)
         print_summary(summary, args.threshold)
+        steps = decompose_steps(model, cards_by_run)
+        if steps:
+            print_steps(summarize_steps(steps))
+            all_steps.extend(steps)
         if args.show_machines:
             print_machines(model, flagged)
         all_rows.extend(rows)
@@ -304,10 +450,19 @@ def main():
 
     if not summaries:
         sys.exit("No model had enough cards.")
+    overlap = seller_overlap(flagged)
+    if overlap["flagged cards"]:
+        print(f"\nacross all models: {overlap['flagged cards']} flagged cards from {overlap['sellers']} sellers. "
+              f"{overlap['sellers in two or more models']} of those sellers show up in two or more GPU models. "
+              f"The largest holds {100 * overlap['largest seller share']:.0f}% of all flagged cards, "
+              f"the top three hold {100 * overlap['top three sellers share']:.0f}%.")
+
     args.out.mkdir(parents=True, exist_ok=True)
     write_csv(all_rows, args.out / "repricing_by_snapshot.csv")
     write_csv(summaries, args.out / "repricing_by_model.csv")
-    print(f"\ntables: {args.out / 'repricing_by_snapshot.csv'} and {args.out / 'repricing_by_model.csv'}")
+    if all_steps:
+        write_csv(all_steps, args.out / "repricing_steps.csv")
+    print(f"\ntables in {args.out}: repricing_by_snapshot.csv, repricing_by_model.csv, repricing_steps.csv")
 
 
 if __name__ == "__main__":

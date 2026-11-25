@@ -99,5 +99,85 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual(rows[0]["cards: all cards"], 16)
 
 
+class ControlTests(unittest.TestCase):
+    def test_rentable_movers_are_the_control_group(self):
+        runs = {"r1": [card("a", 2.0, free=True), card("b", 4.0)],
+                "r2": [card("a", 3.0, free=True), card("b", 6.0)]}
+        self.assertEqual(list(repricing.find_movers(runs, 0.20, while_rentable=True)), [("H100 SXM", "a")])
+        self.assertEqual(list(repricing.find_repricers(runs, 0.20)), [("H100 SXM", "b")])
+
+    def test_control_set_drops_only_control_cards(self):
+        cards = [card("a", 6.0), card("b", 2.0), card("c", 2.5, free=True)]
+        ways = repricing.three_ways(cards, {("H100 SXM", "a"): {}}, {("H100 SXM", "c"): {}})
+        self.assertEqual([c["gpu_id"] for c in ways["control"]], ["a", "b"])
+        # With no control group given, the control set is every card.
+        self.assertEqual(len(repricing.three_ways(cards, {})["control"]), 3)
+
+
+class SellerOverlapTests(unittest.TestCase):
+    def test_counts_sellers_and_models(self):
+        flagged = {
+            ("H100 SXM", "a"): {"host_id": 1}, ("H100 SXM", "b"): {"host_id": 1},
+            ("H200", "c"): {"host_id": 1}, ("H200", "d"): {"host_id": 2},
+        }
+        overlap = repricing.seller_overlap(flagged)
+        self.assertEqual(overlap["sellers"], 2)
+        self.assertEqual(overlap["sellers in two or more models"], 1)
+        self.assertAlmostEqual(overlap["largest seller share"], 0.75)
+        self.assertAlmostEqual(overlap["top three sellers share"], 1.0)
+
+    def test_empty(self):
+        self.assertEqual(repricing.seller_overlap({})["sellers"], 0)
+
+
+class DecomposeTests(unittest.TestCase):
+    def parts(self, step):
+        return (step["price moved, not rentable"], step["price moved, rentable"], step["entering or leaving"])
+
+    def test_repricing_a_card_nobody_can_rent(self):
+        runs = {"r1": [card("a", 4.0), card("b", 2.0)], "r2": [card("a", 6.0), card("b", 2.0)]}
+        step = repricing.decompose_steps("H100 SXM", runs)[0]
+        self.assertAlmostEqual(step["change"], 1.0)
+        not_rentable, rentable, mix = self.parts(step)
+        self.assertAlmostEqual(not_rentable, 1.0)
+        self.assertAlmostEqual(rentable, 0.0)
+        self.assertAlmostEqual(mix, 0.0)
+
+    def test_repricing_a_rentable_card(self):
+        runs = {"r1": [card("a", 4.0, free=True), card("b", 2.0)], "r2": [card("a", 6.0), card("b", 2.0)]}
+        not_rentable, rentable, mix = self.parts(repricing.decompose_steps("H100 SXM", runs)[0])
+        self.assertAlmostEqual(not_rentable, 0.0)
+        self.assertAlmostEqual(rentable, 1.0)
+        self.assertAlmostEqual(mix, 0.0)
+
+    def test_a_card_entering_is_mix(self):
+        runs = {"r1": [card("a", 2.0), card("b", 2.0)], "r2": [card("a", 2.0), card("b", 2.0), card("c", 5.0)]}
+        step = repricing.decompose_steps("H100 SXM", runs)[0]
+        not_rentable, rentable, mix = self.parts(step)
+        self.assertAlmostEqual(step["change"], 1.0)
+        self.assertAlmostEqual(not_rentable, 0.0)
+        self.assertAlmostEqual(mix, 1.0)
+        self.assertEqual((step["cards staying"], step["cards entered"], step["cards left"]), (2, 1, 0))
+
+    def test_parts_always_add_up_to_the_change(self):
+        runs = {
+            "r1": [card("a", 4.0), card("b", 2.0, free=True), card("c", 3.0)],
+            "r2": [card("a", 6.5), card("b", 2.4), card("d", 9.0), card("z", 1.0, model="L40S")],
+            "r3": [card("a", 3.9), card("d", 9.0, free=True)],
+        }
+        steps = repricing.decompose_steps("H100 SXM", runs)
+        self.assertEqual(len(steps), 2)
+        for step in steps:
+            self.assertAlmostEqual(sum(self.parts(step)), step["change"])
+            self.assertAlmostEqual(step["change"], step["average now"] - step["average before"])
+
+    def test_step_summary_is_a_share_of_the_price_level(self):
+        runs = {"r1": [card("a", 4.0), card("b", 2.0)], "r2": [card("a", 6.0), card("b", 2.0)]}
+        summary = repricing.summarize_steps(repricing.decompose_steps("H100 SXM", runs))
+        self.assertAlmostEqual(summary["change"], 1.0 / 3.0)
+        self.assertAlmostEqual(summary["price moved, not rentable"], 1.0 / 3.0)
+        self.assertAlmostEqual(summary["entering or leaving"], 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()
