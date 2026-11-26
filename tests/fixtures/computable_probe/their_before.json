@@ -1,0 +1,112 @@
+{
+ "offers": [
+  {
+   "id": 1,
+   "machine_id": 101,
+   "host_id": 1,
+   "gpu_name": "H100 SXM",
+   "num_gpus": 1,
+   "dph_total": 2.5,
+   "dph_base": 2.45,
+   "verification": "verified",
+   "geolocation": "Texas, US",
+   "rentable": true,
+   "gpu_ids": [
+    1010
+   ]
+  },
+  {
+   "id": 2,
+   "machine_id": 101,
+   "host_id": 1,
+   "gpu_name": "H100 SXM",
+   "num_gpus": 4,
+   "dph_total": 9.6,
+   "dph_base": 9.408,
+   "verification": "verified",
+   "geolocation": "Texas, US",
+   "rentable": true,
+   "gpu_ids": [
+    1010,
+    1011,
+    1012,
+    1013
+   ]
+  },
+  {
+   "id": 3,
+   "machine_id": 102,
+   "host_id": 2,
+   "gpu_name": "H100 SXM",
+   "num_gpus": 2,
+   "dph_total": 4.0,
+   "dph_base": 3.92,
+   "verification": "verified",
+   "geolocation": "Quebec, CA",
+   "rentable": true,
+   "gpu_ids": [
+    1020,
+    1021
+   ]
+  },
+  {
+   "id": 4,
+   "machine_id": 103,
+   "host_id": 3,
+   "gpu_name": "H100 SXM",
+   "num_gpus": 1,
+   "dph_total": 1.5,
+   "dph_base": 1.47,
+   "verification": "unverified",
+   "geolocation": "Bavaria, DE",
+   "rentable": true,
+   "gpu_ids": [
+    1030
+   ]
+  },
+  {
+   "id": 5,
+   "machine_id": 199,
+   "host_id": 9,
+   "gpu_name": "H100 SXM",
+   "num_gpus": 1,
+   "dph_total": 0.9,
+   "dph_base": 0.882,
+   "verification": "verified",
+   "geolocation": "Ohio, US",
+   "rentable": true,
+   "gpu_ids": [
+    1990
+   ],
+   "is_bid": true
+  },
+  {
+   "id": 6,
+   "machine_id": 198,
+   "host_id": 9,
+   "gpu_name": "H100 NVL",
+   "num_gpus": 1,
+   "dph_total": 0.8,
+   "dph_base": 0.784,
+   "verification": "verified",
+   "geolocation": "Ohio, US",
+   "rentable": true,
+   "gpu_ids": [
+    1980
+   ]
+  },
+  {
+   "id": 7,
+   "machine_id": 197,
+   "host_id": 9,
+   "gpu_name": "H100 SXM",
+   "num_gpus": 0,
+   "dph_total": 0.7,
+   "dph_base": 0.686,
+   "verification": "verified",
+   "geolocation": "Ohio, US",
+   "rentable": true,
+   "gpu_ids": []
+  }
+ ]
+}

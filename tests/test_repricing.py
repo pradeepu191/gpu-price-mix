@@ -179,5 +179,73 @@ class DecomposeTests(unittest.TestCase):
         self.assertAlmostEqual(summary["entering or leaving"], 0.0)
 
 
+class GapFillTests(unittest.TestCase):
+    def test_a_short_gap_is_filled_with_the_last_reading(self):
+        runs = {"r1": [card("a", 2.0, free=True)], "r2": [], "r3": [card("a", 2.0)]}
+        filled, counts = repricing.fill_short_gaps(runs, max_gap=3)
+        self.assertEqual(len(filled["r2"]), 1)
+        self.assertTrue(filled["r2"][0]["filled"])
+        self.assertTrue(filled["r2"][0]["free"])
+        self.assertAlmostEqual(filled["r2"][0]["price"], 2.0)
+        self.assertEqual(counts["back within the limit"], 1)
+        self.assertEqual(counts["same price on return"], 1)
+        self.assertEqual(runs["r2"], [])   # the input is left alone
+
+    def test_a_long_gap_is_not_filled(self):
+        runs = {"r1": [card("a", 2.0)], "r2": [], "r3": [], "r4": [card("a", 2.0)]}
+        filled, counts = repricing.fill_short_gaps(runs, max_gap=1)
+        self.assertEqual(filled["r2"], [])
+        self.assertEqual(counts["back later"], 1)
+
+    def test_a_card_that_never_returns_is_not_filled(self):
+        runs = {"r1": [card("a", 2.0), card("b", 3.0)], "r2": [card("b", 3.0)]}
+        filled, counts = repricing.fill_short_gaps(runs)
+        self.assertEqual(len(filled["r2"]), 1)
+        self.assertEqual(counts["not back yet"], 1)
+
+    def test_filling_removes_fake_mix_from_the_steps(self):
+        runs = {"r1": [card("a", 2.0), card("b", 6.0)], "r2": [card("a", 2.0)], "r3": [card("a", 2.0), card("b", 6.0)]}
+        raw = repricing.decompose_steps("H100 SXM", runs)
+        self.assertAlmostEqual(raw[0]["entering or leaving"], -2.0)
+        filled, _ = repricing.fill_short_gaps(runs)
+        for step in repricing.decompose_steps("H100 SXM", filled):
+            self.assertAlmostEqual(step["change"], 0.0)
+
+
+class RentalStartTests(unittest.TestCase):
+    def test_free_then_taken_is_a_start_at_the_free_price(self):
+        runs = {"20261121T000000Z": [card("a", 2.0, free=True), card("b", 5.0)],
+                "20261121T020000Z": [card("a", 2.5), card("b", 5.0)]}
+        changes = repricing.state_changes("H100 SXM", runs)
+        kinds = sorted(change["kind"] for change in changes)
+        self.assertEqual(kinds, ["got taken", "stayed taken"])
+        hours = repricing.hours_between("20261121T000000Z", "20261121T020000Z")
+        self.assertAlmostEqual(hours, 2.0)
+        summary = repricing.summarize_rentals("H100 SXM", changes, 3.5, hours)
+        self.assertEqual(summary["rental starts"], 1)
+        self.assertAlmostEqual(summary["card starts per hour"], 0.5)
+        self.assertAlmostEqual(summary["average price locked in"], 2.0)
+        self.assertAlmostEqual(summary["asking average above locked in"], 0.75)
+        self.assertAlmostEqual(summary["drift per step: stayed taken"], 0.0)
+
+    def test_filled_readings_never_count_as_starts(self):
+        runs = {"r1": [card("a", 2.0, free=True)], "r2": [], "r3": [card("a", 2.0)]}
+        filled, _ = repricing.fill_short_gaps(runs)
+        self.assertEqual(repricing.state_changes("H100 SXM", filled), [])
+
+    def test_no_starts(self):
+        summary = repricing.summarize_rentals("H100 SXM", [], 3.0, 10.0)
+        self.assertEqual(summary["rental starts"], 0)
+        self.assertIsNone(summary["average price locked in"])
+
+
+class TravelTests(unittest.TestCase):
+    def test_flapping_travels_far_and_ends_where_it_began(self):
+        runs = {"r1": [card("a", 4.0)], "r2": [card("a", 6.0)], "r3": [card("a", 4.0)]}
+        summary = repricing.summarize_steps(repricing.decompose_steps("H100 SXM", runs))
+        self.assertAlmostEqual(summary["taken cards: net"], 0.0)
+        self.assertAlmostEqual(summary["taken cards: travel"], 4.0 / 5.0)
+
+
 if __name__ == "__main__":
     unittest.main()

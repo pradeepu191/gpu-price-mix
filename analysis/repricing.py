@@ -29,8 +29,19 @@ Method
        same cards, price moved, rentable at one reading or both
        cards entering or leaving the list (the mix effect)
      This part uses no threshold and no flagging, so it is not circular.
-     Caution: Vast's lookups sometimes return only part of a machine, so some
-     "entering or leaving" is the recorder missing cards, not cards moving.
+  7. Gap filling. Vast's lookups often return only part of a machine, so cards
+     drop out of one snapshot and are back in the next at the same price. A card
+     missing for up to 3 snapshots that then returns is treated as present the
+     whole time, at its last seen price. Without this, most "entering or leaving"
+     is the recorder missing cards, not cards moving. Steps 2 to 6 use the filled
+     data. The newest few snapshots cannot be filled yet, because nobody knows
+     whether a card missing there will return.
+  8. Rental starts. A card that is rentable at one reading and taken at the next
+     most likely got rented, at the price shown while it was free. That gives a
+     rough stand-in for executed rentals: how many start per hour, and what price
+     they lock in compared with the average asking price. This step uses only
+     real readings, never filled ones. "Taken" could also mean the seller pulled
+     the card, and rentals shorter than the gap between snapshots are missed.
 
 What this does and does not show
   It shows how much an average of listed prices depends on which prices are
@@ -41,13 +52,17 @@ What this does and does not show
 Usage (on the droplet, reads only archived files, uses no Vast quota)
   python3 analysis/repricing.py --root /root/data
   python3 analysis/repricing.py --root /root/data --model "H100 SXM" --show-machines
+  Only snapshots collected after a given one, to check a prediction on fresh data:
+    python3 analysis/repricing.py --root /root/data --since 20261125T160347Z
 """
 
 import argparse
 import csv
+import math
 import random
 import statistics
 import sys
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -59,6 +74,7 @@ THRESHOLD = 0.20        # a card is flagged if its asking price moved more than 
 RENTALS = 20            # rentals per hour used for the chance band
 MIN_CARDS_MODEL = 10    # models with fewer cards than this are skipped
 MIN_CARDS_BAND = 5      # a chance band needs at least this many cards
+MAX_GAP = 3             # a card missing for up to this many snapshots, then back, is filled in
 WAYS = ["all cards", "without those cards", "rentable cards only", "control"]
 
 
@@ -73,6 +89,54 @@ def load_cards_by_run(root, market_type):
         offers = vast_data.load_offers(root, market_type, run_id)
         cards_by_run[run_id] = vast_data.physical_gpus(offers)
     return cards_by_run
+
+
+def fill_short_gaps(cards_by_run, max_gap=MAX_GAP):
+    """Treat a card that vanishes for a few snapshots and then returns as present throughout.
+
+    The filled readings copy the card's last seen price and rentable status, and
+    carry "filled": True. Returns (filled cards_by_run, counts describing the gaps).
+    """
+    run_ids = sorted(cards_by_run)
+    position_of = {}
+    for position, run_id in enumerate(run_ids):
+        position_of[run_id] = position
+    history = {}
+    for run_id in run_ids:
+        for card in cards_by_run[run_id]:
+            history.setdefault(card_key(card), []).append((position_of[run_id], card))
+
+    filled = {}
+    for run_id in run_ids:
+        filled[run_id] = list(cards_by_run[run_id])
+    counts = {"times a card went missing": 0, "back within the limit": 0, "same price on return": 0,
+              "back later": 0, "not back yet": 0, "readings added": 0}
+    newest = len(run_ids) - 1
+    for readings in history.values():
+        for index in range(len(readings)):
+            position, card = readings[index]
+            if index + 1 == len(readings):
+                if position < newest:
+                    counts["times a card went missing"] += 1
+                    counts["not back yet"] += 1
+                continue
+            next_position, next_card = readings[index + 1]
+            gap = next_position - position - 1
+            if gap == 0:
+                continue
+            counts["times a card went missing"] += 1
+            if gap > max_gap:
+                counts["back later"] += 1
+                continue
+            counts["back within the limit"] += 1
+            if abs(next_card["price"] - card["price"]) < 0.005:
+                counts["same price on return"] += 1
+            for missing in range(position + 1, next_position):
+                copy = dict(card)
+                copy["filled"] = True
+                filled[run_ids[missing]].append(copy)
+                counts["readings added"] += 1
+    return filled, counts
 
 
 def find_movers(cards_by_run, threshold=THRESHOLD, while_rentable=False):
@@ -358,7 +422,97 @@ def summarize_steps(steps):
         summary[part] = statistics.fmean(abs(step[part]) for step in steps) / level
     summary["cards entered or left per step"] = statistics.fmean(
         step["cards entered"] + step["cards left"] for step in steps)
+    # Flapping or drift: how far the price on taken cards travelled in total, and where it ended up.
+    summary["taken cards: travel"] = sum(abs(step["price moved, not rentable"]) for step in steps) / level
+    summary["taken cards: net"] = sum(step["price moved, not rentable"] for step in steps) / level
     return summary
+
+
+def hours_between(first_run_id, last_run_id):
+    stamp = "%Y%m%dT%H%M%SZ"
+    span = datetime.strptime(last_run_id, stamp) - datetime.strptime(first_run_id, stamp)
+    return span.total_seconds() / 3600
+
+
+def state_changes(model, cards_by_run):
+    """Every card seen at two snapshots in a row, with what happened to it in between.
+
+    Uses real readings only. kind is one of: stayed taken, stayed free,
+    became free, got taken. "got taken" is the stand-in for a rental starting.
+    """
+    changes = []
+    previous = None
+    for run_id in sorted(cards_by_run):
+        current = {}
+        for card in cards_by_run[run_id]:
+            if card["gpu_name"] == model and not card.get("filled"):
+                current[card["gpu_id"]] = card
+        if previous is not None:
+            for gpu_id, card in current.items():
+                before = previous.get(gpu_id)
+                if before is None or before["price"] <= 0 or card["price"] <= 0:
+                    continue
+                if before["free"] and not card["free"]:
+                    kind = "got taken"
+                elif before["free"]:
+                    kind = "stayed free"
+                elif card["free"]:
+                    kind = "became free"
+                else:
+                    kind = "stayed taken"
+                changes.append({"run_id": run_id, "kind": kind, "machine_id": card["machine_id"],
+                                "price before": before["price"],
+                                "log change": math.log(card["price"] / before["price"])})
+        previous = current
+    return changes
+
+
+def summarize_rentals(model, changes, average_asking, hours):
+    """Rental starts per hour, the price they locked in, and how asks drift by state."""
+    starts = []
+    for change in changes:
+        if change["kind"] == "got taken":
+            starts.append(change)
+    machines = set()
+    for start in starts:
+        machines.add((start["run_id"], start["machine_id"]))
+    summary = {
+        "model": model,
+        "rental starts": len(starts),
+        "card starts per hour": len(starts) / hours if hours else None,
+        "machine starts per hour": len(machines) / hours if hours else None,
+        "average asking price, all cards": average_asking,
+        "average price locked in": None,
+        "asking average above locked in": None,
+    }
+    if starts:
+        locked = statistics.fmean(start["price before"] for start in starts)
+        summary["average price locked in"] = locked
+        summary["asking average above locked in"] = average_asking / locked - 1
+    for kind in ("stayed taken", "stayed free"):
+        moves = []
+        for change in changes:
+            if change["kind"] == kind:
+                moves.append(change["log change"])
+        summary[f"drift per step: {kind}"] = statistics.fmean(moves) if moves else None
+    return summary
+
+
+def print_rentals(summary):
+    if not summary["rental starts"]:
+        print("  no rental starts seen (no card went from rentable to taken between two snapshots)")
+        return
+    print(f"  rental starts (rentable at one reading, taken at the next): {summary['rental starts']}, "
+          f"about {summary['card starts per hour']:.1f} cards an hour on "
+          f"{summary['machine starts per hour']:.1f} machines an hour")
+    print(f"    average asking price, all cards   ${summary['average asking price, all cards']:.2f}")
+    print(f"    average price locked in           ${summary['average price locked in']:.2f}   "
+          f"(the asking average is {100 * summary['asking average above locked in']:+.0f}% from it)")
+    taken = summary["drift per step: stayed taken"]
+    free = summary["drift per step: stayed free"]
+    if taken is not None and free is not None:
+        print(f"    asking price drift per step: cards that stayed taken {100 * taken:+.2f}%, "
+              f"cards that stayed free {100 * free:+.2f}%")
 
 
 def print_steps(step_summary):
@@ -372,6 +526,9 @@ def print_steps(step_summary):
     for part in STEP_PARTS:
         print(f"    {labels[part]:40} {100 * step_summary[part]:5.2f}%")
     print(f"    cards entering or leaving per step: about {step_summary['cards entered or left per step']:.0f}")
+    print(f"    flapping or drift: over the whole period the price on taken cards travelled "
+          f"{100 * step_summary['taken cards: travel']:.0f}% of the average price and ended "
+          f"{100 * step_summary['taken cards: net']:+.1f}% from where it started")
     print("    (the three parts add up to the whole step exactly, sign included. Their sizes can add up to more"
           " when they pull in opposite directions.)")
 
@@ -409,16 +566,35 @@ def main():
     parser.add_argument("--threshold", type=float, default=THRESHOLD)
     parser.add_argument("--repeats", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--since", default=None,
+                        help="use only snapshots after this run_id, to test a prediction on data collected later")
     parser.add_argument("--show-machines", action="store_true",
                         help="list the flagged machines (private inspection, do not publish ids)")
     parser.add_argument("--out", type=Path, default=Path("/root/data/analysis"))
     args = parser.parse_args()
 
     cards_by_run = load_cards_by_run(args.root, args.market)
+    if args.since:
+        later = {}
+        for run_id, cards in cards_by_run.items():
+            if run_id > args.since:
+                later[run_id] = cards
+        cards_by_run = later
     if len(cards_by_run) < 2:
         sys.exit("Need at least two full snapshots.")
     run_ids = sorted(cards_by_run)
     print(f"{len(run_ids)} full snapshots, {run_ids[0]} to {run_ids[-1]}, {args.market}")
+
+    raw_cards_by_run = cards_by_run
+    cards_by_run, gaps = fill_short_gaps(raw_cards_by_run)
+    missing = gaps["times a card went missing"]
+    if missing:
+        back = gaps["back within the limit"]
+        print(f"gap filling: a card went missing {missing} times. {100 * back / missing:.0f}% were back within "
+              f"{MAX_GAP} snapshots, {100 * gaps['same price on return'] / max(back, 1):.0f}% of those at the same price. "
+              f"{gaps['readings added']} readings filled in. Everything below uses the filled data, "
+              f"except rental starts.")
+    hours = hours_between(run_ids[0], run_ids[-1])
 
     flagged = find_repricers(cards_by_run, args.threshold)
     control = find_movers(cards_by_run, args.threshold, while_rentable=True)
@@ -431,6 +607,7 @@ def main():
 
     all_rows = []
     all_steps = []
+    rental_summaries = []
     summaries = []
     for model in sorted(models):
         rows = snapshot_rows(model, cards_by_run, flagged, args.repeats, args.seed, control)
@@ -443,6 +620,10 @@ def main():
         if steps:
             print_steps(summarize_steps(steps))
             all_steps.extend(steps)
+        asking = statistics.fmean(column(rows, "average: all cards"))
+        rentals = summarize_rentals(model, state_changes(model, raw_cards_by_run), asking, hours)
+        print_rentals(rentals)
+        rental_summaries.append(rentals)
         if args.show_machines:
             print_machines(model, flagged)
         all_rows.extend(rows)
@@ -462,7 +643,9 @@ def main():
     write_csv(summaries, args.out / "repricing_by_model.csv")
     if all_steps:
         write_csv(all_steps, args.out / "repricing_steps.csv")
-    print(f"\ntables in {args.out}: repricing_by_snapshot.csv, repricing_by_model.csv, repricing_steps.csv")
+    write_csv(rental_summaries, args.out / "repricing_rentals.csv")
+    print(f"\ntables in {args.out}: repricing_by_snapshot.csv, repricing_by_model.csv, repricing_steps.csv, "
+          f"repricing_rentals.csv")
 
 
 if __name__ == "__main__":

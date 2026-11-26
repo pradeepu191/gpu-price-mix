@@ -1,0 +1,145 @@
+{
+ "101": {
+  "offers": [
+   {
+    "id": 1,
+    "machine_id": 101,
+    "host_id": 1,
+    "gpu_name": "H100 SXM",
+    "num_gpus": 1,
+    "dph_total": 2.5,
+    "dph_base": 2.45,
+    "verification": "verified",
+    "geolocation": "Texas, US",
+    "rentable": true,
+    "gpu_ids": [
+     1010
+    ]
+   },
+   {
+    "id": 2,
+    "machine_id": 101,
+    "host_id": 1,
+    "gpu_name": "H100 SXM",
+    "num_gpus": 4,
+    "dph_total": 9.6,
+    "dph_base": 9.408,
+    "verification": "verified",
+    "geolocation": "Texas, US",
+    "rentable": true,
+    "gpu_ids": [
+     1010,
+     1011,
+     1012,
+     1013
+    ]
+   }
+  ]
+ },
+ "104": {
+  "offers": [
+   {
+    "id": 8,
+    "machine_id": 104,
+    "host_id": 4,
+    "gpu_name": "H100 SXM",
+    "num_gpus": 2,
+    "dph_total": 3.6,
+    "dph_base": 3.528,
+    "verification": "verified",
+    "geolocation": "Ohio, US",
+    "rentable": true,
+    "gpu_ids": [
+     1040,
+     1041
+    ]
+   }
+  ]
+ },
+ "105": {
+  "offers": [
+   {
+    "id": 9,
+    "machine_id": 105,
+    "host_id": 5,
+    "gpu_name": "H100 SXM",
+    "num_gpus": 1,
+    "dph_total": 2.2,
+    "dph_base": 2.156,
+    "verification": "verified",
+    "geolocation": "Oregon, US",
+    "rentable": true,
+    "gpu_ids": [
+     1050
+    ]
+   }
+  ]
+ },
+ "106": {
+  "offers": [
+   {
+    "id": 10,
+    "machine_id": 106,
+    "host_id": 6,
+    "gpu_name": "H100 SXM",
+    "num_gpus": 8,
+    "dph_total": 13.6,
+    "dph_base": 13.328,
+    "verification": "verified",
+    "geolocation": "Utah, US",
+    "rentable": true,
+    "gpu_ids": [
+     1060,
+     1061,
+     1062,
+     1063,
+     1064,
+     1065,
+     1066,
+     1067
+    ]
+   }
+  ]
+ },
+ "107": {
+  "offers": []
+ },
+ "108": {
+  "offers": [
+   {
+    "id": 12,
+    "machine_id": 108,
+    "host_id": 6,
+    "gpu_name": "H100 SXM",
+    "num_gpus": 1,
+    "dph_total": 2.1,
+    "dph_base": 2.058,
+    "verification": "verified",
+    "geolocation": "Iowa, US",
+    "rentable": true,
+    "gpu_ids": [
+     1080
+    ]
+   }
+  ]
+ },
+ "109": {
+  "offers": [
+   {
+    "id": 13,
+    "machine_id": 109,
+    "host_id": 8,
+    "gpu_name": "H100 SXM",
+    "num_gpus": 1,
+    "dph_total": 1.2,
+    "dph_base": 1.176,
+    "verification": "deverified",
+    "geolocation": "Idaho, US",
+    "rentable": true,
+    "gpu_ids": [
+     1090
+    ]
+   }
+  ]
+ }
+}
